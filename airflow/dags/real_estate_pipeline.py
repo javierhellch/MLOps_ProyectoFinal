@@ -1,0 +1,986 @@
+from __future__ import annotations
+
+from datetime import datetime
+import hashlib
+import json
+import os
+
+import numpy as np
+import pandas as pd
+import requests
+from airflow.decorators import dag, task
+from airflow.operators.python import BranchPythonOperator
+from airflow.operators.empty import EmptyOperator
+from sqlalchemy import create_engine, text
+
+GROUP_NUMBER = int(os.getenv("GROUP_NUMBER", "8"))
+DATA_API_URL = os.getenv("DATA_API_URL", "http://data-api:80")
+
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres")
+POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "mlops_real_estate")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "mlops_user")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "mlops_password")
+
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
+MLFLOW_EXPERIMENT_NAME = os.getenv("MLFLOW_EXPERIMENT_NAME", "real-estate-price-prediction")
+MLFLOW_MODEL_NAME = os.getenv("MLFLOW_MODEL_NAME", "real-estate-price-model")
+MLFLOW_MODEL_ALIAS = os.getenv("MLFLOW_MODEL_ALIAS", "champion")
+
+DB_URI = (
+    f"postgresql+psycopg2://{POSTGRES_USER}:{POSTGRES_PASSWORD}"
+    f"@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+)
+
+COLUMN_NAMES = [
+    "price", "brokered_by", "bed", "bath", "acre_lot",
+    "house_size", "zip_code", "col_07", "col_08", "col_09",
+    "col_10", "col_11", "col_12", "col_13", "col_14",
+    "col_15", "col_16", "col_17", "col_18", "col_19",
+    "col_20", "col_21", "col_22", "col_23", "col_24",
+    "col_25", "col_26", "col_27", "col_28", "col_29",
+    "col_30", "col_31", "col_32", "col_33", "col_34",
+    "col_35", "col_36", "col_37", "col_38", "col_39",
+    "col_40", "col_41", "col_42", "col_43", "col_44",
+    "col_45", "col_46", "col_47", "col_48", "col_49",
+    "col_50", "col_51", "col_52", "col_53", "col_54",
+]
+
+FEATURE_COLS = [c for c in COLUMN_NAMES if c != "price"]
+TARGET_COL = "price"
+
+MIN_RECORDS_TO_TRAIN = 1000
+MIN_VOLUME_INCREASE_PCT = 5.0
+DRIFT_THRESHOLD = 0.2
+MAE_IMPROVEMENT_PCT = 3.0
+
+
+@dag(
+    dag_id="real_estate_pipeline",
+    start_date=datetime(2026, 1, 1),
+    schedule=None,
+    catchup=False,
+    tags=["mlops", "real_estate"],
+)
+def real_estate_pipeline():
+
+    start = EmptyOperator(task_id="start")
+    end = EmptyOperator(task_id="end", trigger_rule="none_failed_min_one_success")
+
+    @task
+    def fetch_batch_from_api() -> dict:
+        url = f"{DATA_API_URL}/data"
+        params = {"group_number": GROUP_NUMBER}
+
+        for attempt in range(3):
+            try:
+                response = requests.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+
+                if not data.get("data"):
+                    raise ValueError("La API retornó datos vacíos.")
+
+                batch_number = data["batch_number"]
+                rows = data["data"]
+
+                return {
+                    "batch_number": batch_number,
+                    "group_number": GROUP_NUMBER,
+                    "num_records": len(rows),
+                    "num_columns": len(rows[0]) if rows else 0,
+                    "rows": rows,
+                }
+
+            except Exception as e:
+                if attempt == 2:
+                    raise RuntimeError(f"Error al consumir la API después de 3 intentos: {e}")
+                import time
+                time.sleep(5)
+
+    @task
+    def store_raw_batch(batch_info: dict) -> dict:
+        rows = batch_info["rows"]
+        batch_number = batch_info["batch_number"]
+        batch_id = f"batch_{GROUP_NUMBER}_{batch_number}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+
+        engine = create_engine(DB_URI)
+
+        with engine.begin() as conn:
+            existing = conn.execute(
+                text("SELECT COUNT(*) FROM raw.batch_metadata WHERE batch_number = :bn AND group_number = :gn"),
+                {"bn": batch_number, "gn": GROUP_NUMBER}
+            ).scalar()
+
+            if existing > 0:
+                existing_batch = conn.execute(
+                    text("SELECT batch_id FROM raw.batch_metadata WHERE batch_number = :bn AND group_number = :gn LIMIT 1"),
+                    {"bn": batch_number, "gn": GROUP_NUMBER}
+                ).scalar()
+                return {
+                    "batch_id": existing_batch,
+                    "batch_number": batch_number,
+                    "num_records": batch_info["num_records"],
+                    "already_processed": True,
+                }
+
+        records = []
+        for i, row in enumerate(rows):
+            row_dict = {COLUMN_NAMES[j]: row[j] for j in range(len(row))}
+            row_json = json.dumps(row_dict, sort_keys=True)
+            records.append({
+                "batch_id": batch_id,
+                "batch_number": batch_number,
+                "group_number": GROUP_NUMBER,
+                "row_index": i,
+                "raw_data": row_json,
+                "status": "loaded",
+            })
+
+        insert_raw_sql = text("""
+            INSERT INTO raw.real_estate_raw
+                (batch_id, batch_number, group_number, row_index, raw_data, status)
+            VALUES
+                (:batch_id, :batch_number, :group_number, :row_index,
+                 CAST(:raw_data AS JSONB), :status)
+        """)
+
+        insert_meta_sql = text("""
+            INSERT INTO raw.batch_metadata
+                (batch_id, batch_number, group_number, num_records, num_columns, validation_status)
+            VALUES
+                (:batch_id, :batch_number, :group_number, :num_records, :num_columns, 'pending')
+        """)
+
+        engine = create_engine(DB_URI)
+        with engine.begin() as conn:
+            conn.execute(insert_raw_sql, records)
+            conn.execute(insert_meta_sql, {
+                "batch_id": batch_id,
+                "batch_number": batch_number,
+                "group_number": GROUP_NUMBER,
+                "num_records": batch_info["num_records"],
+                "num_columns": batch_info["num_columns"],
+            })
+
+        return {
+            "batch_id": batch_id,
+            "batch_number": batch_number,
+            "num_records": batch_info["num_records"],
+            "already_processed": False,
+        }
+
+    @task
+    def validate_schema(raw_result: dict) -> dict:
+        batch_id = raw_result["batch_id"]
+        engine = create_engine(DB_URI)
+
+        with engine.connect() as conn:
+            sample = conn.execute(
+                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid LIMIT 1"),
+                {"bid": batch_id}
+            ).fetchone()
+
+        if not sample:
+            raise ValueError(f"No se encontraron registros para batch_id={batch_id}")
+
+        data = sample[0]
+        if isinstance(data, str):
+            data = json.loads(data)
+
+        received_cols = set(data.keys())
+        expected_cols = set(COLUMN_NAMES)
+        missing_cols = expected_cols - received_cols
+        extra_cols = received_cols - expected_cols
+
+        schema_valid = len(missing_cols) == 0
+        issues = []
+
+        if missing_cols:
+            issues.append(f"Columnas faltantes: {missing_cols}")
+        if extra_cols:
+            issues.append(f"Columnas extra: {extra_cols}")
+
+        engine = create_engine(DB_URI)
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE raw.batch_metadata
+                    SET validation_status = :status
+                    WHERE batch_id = :bid
+                """),
+                {"status": "schema_valid" if schema_valid else "schema_invalid", "bid": batch_id}
+            )
+
+        return {
+            **raw_result,
+            "schema_valid": schema_valid,
+            "schema_issues": issues,
+        }
+
+    @task
+    def validate_data_quality(schema_result: dict) -> dict:
+        batch_id = schema_result["batch_id"]
+        engine = create_engine(DB_URI)
+
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid"),
+                {"bid": batch_id}
+            ).fetchall()
+
+        records = []
+        for row in rows:
+            data = row[0]
+            if isinstance(data, str):
+                data = json.loads(data)
+            records.append({k: float(v) if v is not None else None for k, v in data.items()})
+
+        df = pd.DataFrame(records)
+
+        null_pct = df.isnull().mean().mean() * 100
+        duplicate_count = df.duplicated().sum()
+        negative_price = (df["price"] < 0).sum()
+        negative_house_size = (df["house_size"] < 0).sum()
+
+        quality_valid = (
+            null_pct < 20.0 and
+            duplicate_count < len(df) * 0.1 and
+            negative_price == 0
+        )
+
+        issues = []
+        if null_pct >= 20.0:
+            issues.append(f"Alto porcentaje de nulos: {null_pct:.1f}%")
+        if duplicate_count >= len(df) * 0.1:
+            issues.append(f"Muchos duplicados: {duplicate_count}")
+        if negative_price > 0:
+            issues.append(f"Precios negativos: {negative_price}")
+        if negative_house_size > 0:
+            issues.append(f"house_size negativos (anomalías): {negative_house_size}")
+
+        engine = create_engine(DB_URI)
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE raw.batch_metadata
+                    SET validation_status = :status
+                    WHERE batch_id = :bid
+                """),
+                {"status": "quality_valid" if quality_valid else "quality_issues", "bid": batch_id}
+            )
+
+        return {
+            **schema_result,
+            "quality_valid": quality_valid,
+            "quality_issues": issues,
+            "null_pct": null_pct,
+            "duplicate_count": int(duplicate_count),
+            "num_records": len(df),
+        }
+
+    @task
+    def detect_new_categories(quality_result: dict) -> dict:
+        batch_id = quality_result["batch_id"]
+        engine = create_engine(DB_URI)
+
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid"),
+                {"bid": batch_id}
+            ).fetchall()
+
+        records = []
+        for row in rows:
+            data = row[0]
+            if isinstance(data, str):
+                data = json.loads(data)
+            records.append(data)
+
+        df = pd.DataFrame(records).apply(pd.to_numeric, errors="coerce")
+
+        one_hot_cols = [c for c in COLUMN_NAMES if c.startswith("col_")]
+        new_categories = {}
+
+        with engine.connect() as conn:
+            historical_count = conn.execute(
+                text("SELECT COUNT(*) FROM clean.real_estate_clean WHERE batch_id != :bid"),
+                {"bid": batch_id}
+            ).scalar()
+
+        if historical_count > 0:
+            with engine.connect() as conn:
+                hist_rows = conn.execute(
+                    text("SELECT " + ", ".join(one_hot_cols) + " FROM clean.real_estate_clean WHERE batch_id != :bid"),
+                    {"bid": batch_id}
+                ).fetchall()
+
+            hist_df = pd.DataFrame(hist_rows, columns=one_hot_cols)
+
+            for col in one_hot_cols:
+                if col in df.columns and col in hist_df.columns:
+                    hist_values = set(hist_df[col].dropna().unique())
+                    curr_values = set(df[col].dropna().unique())
+                    new_vals = curr_values - hist_values
+                    if new_vals:
+                        new_categories[col] = list(new_vals)
+
+        return {
+            **quality_result,
+            "new_categories": new_categories,
+            "has_new_categories": len(new_categories) > 0,
+        }
+
+    @task
+    def detect_data_drift(categories_result: dict) -> dict:
+        batch_id = categories_result["batch_id"]
+        engine = create_engine(DB_URI)
+
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid"),
+                {"bid": batch_id}
+            ).fetchall()
+
+        records = []
+        for row in rows:
+            data = row[0]
+            if isinstance(data, str):
+                data = json.loads(data)
+            records.append(data)
+
+        curr_df = pd.DataFrame(records).apply(pd.to_numeric, errors="coerce")
+
+        numeric_cols = ["price", "brokered_by", "bed", "bath", "house_size", "acre_lot"]
+        drift_detected = False
+        drift_results = {}
+
+        with engine.connect() as conn:
+            historical_count = conn.execute(
+                text("SELECT COUNT(*) FROM clean.real_estate_clean WHERE batch_id != :bid"),
+                {"bid": batch_id}
+            ).scalar()
+
+        if historical_count >= MIN_RECORDS_TO_TRAIN:
+            with engine.connect() as conn:
+                hist_rows = conn.execute(
+                    text(f"SELECT {', '.join(numeric_cols)} FROM clean.real_estate_clean WHERE batch_id != :bid"),
+                    {"bid": batch_id}
+                ).fetchall()
+
+            hist_df = pd.DataFrame(hist_rows, columns=numeric_cols).apply(pd.to_numeric, errors="coerce")
+
+            drift_records = []
+            for col in numeric_cols:
+                if col not in curr_df.columns:
+                    continue
+
+                hist_mean = hist_df[col].mean()
+                hist_std = hist_df[col].std()
+                curr_mean = curr_df[col].mean()
+                curr_std = curr_df[col].std()
+
+                if hist_std > 0:
+                    drift_score = abs(curr_mean - hist_mean) / hist_std
+                else:
+                    drift_score = 0.0
+
+                col_drift = drift_score > DRIFT_THRESHOLD
+                if col_drift:
+                    drift_detected = True
+
+                drift_results[col] = {
+                    "drift_score": float(drift_score),
+                    "drift_detected": col_drift,
+                    "hist_mean": float(hist_mean),
+                    "curr_mean": float(curr_mean),
+                }
+
+                drift_records.append({
+                    "batch_id": batch_id,
+                    "column_name": col,
+                    "mean_historical": float(hist_mean),
+                    "mean_current": float(curr_mean),
+                    "std_historical": float(hist_std),
+                    "std_current": float(curr_std),
+                    "drift_score": float(drift_score),
+                    "drift_detected": col_drift,
+                })
+
+            if drift_records:
+                engine = create_engine(DB_URI)
+                with engine.begin() as conn:
+                    conn.execute(
+                        text("""
+                            INSERT INTO monitoring.data_drift
+                                (batch_id, column_name, mean_historical, mean_current,
+                                 std_historical, std_current, drift_score, drift_detected)
+                            VALUES
+                                (:batch_id, :column_name, :mean_historical, :mean_current,
+                                 :std_historical, :std_current, :drift_score, :drift_detected)
+                        """),
+                        drift_records
+                    )
+
+        return {
+            **categories_result,
+            "drift_detected": drift_detected,
+            "drift_results": drift_results,
+            "historical_count": int(historical_count),
+        }
+
+    @task
+    def preprocess_data(drift_result: dict) -> dict:
+        batch_id = drift_result["batch_id"]
+        batch_number = drift_result["batch_number"]
+        engine = create_engine(DB_URI)
+
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid"),
+                {"bid": batch_id}
+            ).fetchall()
+
+        records = []
+        for row in rows:
+            data = row[0]
+            if isinstance(data, str):
+                data = json.loads(data)
+            records.append(data)
+
+        df = pd.DataFrame(records).apply(pd.to_numeric, errors="coerce")
+
+        anomaly_flags_list = []
+        valid_flags = []
+
+        for _, row in df.iterrows():
+            flags = {}
+            is_valid = True
+
+            if row.get("price", 0) < 0:
+                flags["negative_price"] = True
+                is_valid = False
+            if row.get("house_size", 0) < 0:
+                flags["negative_house_size"] = True
+            if row.get("acre_lot", 0) < 0:
+                flags["negative_acre_lot"] = True
+            if row.get("bed", 0) > 30:
+                flags["extreme_bed"] = True
+
+            anomaly_flags_list.append(json.dumps(flags))
+            valid_flags.append(is_valid)
+
+        df["is_valid"] = valid_flags
+        df["anomaly_flags"] = anomaly_flags_list
+        df["batch_id"] = batch_id
+        df["batch_number"] = batch_number
+
+        col_order = (
+            ["batch_id", "batch_number"] +
+            COLUMN_NAMES +
+            ["is_valid", "anomaly_flags"]
+        )
+
+        df = df[[c for c in col_order if c in df.columns]]
+        df = df.fillna(0)
+
+        records_to_insert = df.to_dict(orient="records")
+
+        col_names_sql = ", ".join(COLUMN_NAMES + ["is_valid", "anomaly_flags", "batch_id", "batch_number"])
+        placeholders = ", ".join([f":{c}" for c in COLUMN_NAMES + ["is_valid", "anomaly_flags", "batch_id", "batch_number"]])
+
+        insert_sql = text(f"""
+            INSERT INTO clean.real_estate_clean ({col_names_sql})
+            VALUES ({placeholders})
+        """)
+
+        engine = create_engine(DB_URI)
+        with engine.begin() as conn:
+            for record in records_to_insert:
+                record["anomaly_flags"] = record.get("anomaly_flags", "{}")
+                conn.execute(insert_sql, record)
+
+        return {
+            **drift_result,
+            "clean_records": len(records_to_insert),
+        }
+
+    @task
+    def decide_training(preprocess_result: dict) -> str:
+        batch_id = preprocess_result["batch_id"]
+        historical_count = preprocess_result.get("historical_count", 0)
+        drift_detected = preprocess_result.get("drift_detected", False)
+        has_new_categories = preprocess_result.get("has_new_categories", False)
+        quality_valid = preprocess_result.get("quality_valid", True)
+
+        engine = create_engine(DB_URI)
+
+        with engine.connect() as conn:
+            total_clean = conn.execute(
+                text("SELECT COUNT(*) FROM clean.real_estate_clean WHERE is_valid = TRUE")
+            ).scalar()
+
+        reason = ""
+        should_train = False
+
+        if not quality_valid:
+            reason = "No se entrena: datos con problemas de calidad críticos."
+            should_train = False
+        elif total_clean < MIN_RECORDS_TO_TRAIN:
+            reason = f"No se entrena: insuficientes registros ({total_clean} < {MIN_RECORDS_TO_TRAIN})."
+            should_train = False
+        elif historical_count == 0:
+            reason = "Se entrena: primer batch, línea base inicial."
+            should_train = True
+        elif drift_detected:
+            reason = "Se entrena: drift detectado en variables relevantes."
+            should_train = True
+        elif has_new_categories:
+            reason = "Se entrena: nuevas categorías detectadas con frecuencia suficiente."
+            should_train = True
+        else:
+            volume_increase = (preprocess_result.get("clean_records", 0) / max(historical_count, 1)) * 100
+            if volume_increase >= MIN_VOLUME_INCREASE_PCT:
+                reason = f"Se entrena: volumen acumulado aumentó {volume_increase:.1f}%."
+                should_train = True
+            else:
+                reason = f"No se entrena: sin cambios significativos (volumen +{volume_increase:.1f}%, sin drift, sin nuevas categorías)."
+                should_train = False
+
+        engine = create_engine(DB_URI)
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE raw.batch_metadata
+                    SET training_decision = :decision,
+                        training_reason = :reason
+                    WHERE batch_id = :bid
+                """),
+                {
+                    "decision": "train" if should_train else "skip",
+                    "reason": reason,
+                    "bid": batch_id,
+                }
+            )
+
+        return "train_candidate_model" if should_train else "skip_training"
+
+    @task
+    def skip_training(preprocess_result: dict) -> dict:
+        batch_id = preprocess_result["batch_id"]
+        engine = create_engine(DB_URI)
+
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE raw.batch_metadata
+                    SET training_executed = FALSE
+                    WHERE batch_id = :bid
+                """),
+                {"bid": batch_id}
+            )
+
+        return {**preprocess_result, "trained": False}
+
+    @task
+    def train_candidate_model(preprocess_result: dict) -> dict:
+        import mlflow
+        import mlflow.sklearn
+        from sklearn.ensemble import GradientBoostingRegressor
+        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+        from sklearn.model_selection import train_test_split
+        from sklearn.pipeline import Pipeline
+        from sklearn.impute import SimpleImputer
+
+        batch_id = preprocess_result["batch_id"]
+        engine = create_engine(DB_URI)
+
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(f"""
+                    SELECT {', '.join(COLUMN_NAMES)}
+                    FROM clean.real_estate_clean
+                    WHERE is_valid = TRUE
+                """)
+            ).fetchall()
+
+        df = pd.DataFrame(rows, columns=COLUMN_NAMES).apply(pd.to_numeric, errors="coerce").fillna(0)
+
+        X = df[FEATURE_COLS]
+        y = df[TARGET_COL]
+
+        X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=42)
+        X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+
+        with mlflow.start_run(run_name=f"candidate_{batch_id}") as run:
+            model = Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("regressor", GradientBoostingRegressor(
+                    n_estimators=100,
+                    max_depth=5,
+                    learning_rate=0.1,
+                    random_state=42,
+                ))
+            ])
+
+            model.fit(X_train, y_train)
+
+            y_pred_val = model.predict(X_val)
+            y_pred_test = model.predict(X_test)
+
+            mae = mean_absolute_error(y_test, y_pred_test)
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred_test))
+            r2 = r2_score(y_test, y_pred_test)
+            mape = np.mean(np.abs((y_test - y_pred_test) / np.maximum(np.abs(y_test), 1))) * 100
+
+            mlflow.log_param("model_type", "GradientBoostingRegressor")
+            mlflow.log_param("n_estimators", 100)
+            mlflow.log_param("max_depth", 5)
+            mlflow.log_param("learning_rate", 0.1)
+            mlflow.log_param("batch_id", batch_id)
+            mlflow.log_param("train_size", len(X_train))
+            mlflow.log_param("val_size", len(X_val))
+            mlflow.log_param("test_size", len(X_test))
+
+            mlflow.log_metric("mae", mae)
+            mlflow.log_metric("rmse", rmse)
+            mlflow.log_metric("r2", r2)
+            mlflow.log_metric("mape", mape)
+
+            mlflow.sklearn.log_model(
+                sk_model=model,
+                artifact_path="model",
+                registered_model_name=MLFLOW_MODEL_NAME,
+            )
+
+            engine = create_engine(DB_URI)
+            with engine.begin() as conn:
+                conn.execute(
+                    text("""
+                        UPDATE raw.batch_metadata
+                        SET training_executed = TRUE,
+                            run_id = :run_id,
+                            mae_candidate = :mae,
+                            rmse_candidate = :rmse,
+                            r2_candidate = :r2
+                        WHERE batch_id = :bid
+                    """),
+                    {
+                        "run_id": run.info.run_id,
+                        "mae": float(mae),
+                        "rmse": float(rmse),
+                        "r2": float(r2),
+                        "bid": batch_id,
+                    }
+                )
+
+            return {
+                **preprocess_result,
+                "trained": True,
+                "run_id": run.info.run_id,
+                "mae": float(mae),
+                "rmse": float(rmse),
+                "r2": float(r2),
+                "mape": float(mape),
+                "train_size": len(X_train),
+                "val_size": len(X_val),
+                "test_size": len(X_test),
+            }
+
+    @task
+    def evaluate_candidate_model(train_result: dict) -> dict:
+        run_id = train_result["run_id"]
+        mae = train_result["mae"]
+        rmse = train_result["rmse"]
+        r2 = train_result["r2"]
+
+        evaluation = {
+            "mae": mae,
+            "rmse": rmse,
+            "r2": r2,
+            "evaluation_passed": mae > 0 and rmse > 0,
+        }
+
+        return {**train_result, "evaluation": evaluation}
+
+    @task
+    def register_candidate_in_mlflow(eval_result: dict) -> dict:
+        import mlflow
+        from mlflow.tracking import MlflowClient
+
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        client = MlflowClient()
+
+        run_id = eval_result["run_id"]
+        model_versions = client.search_model_versions(f"name='{MLFLOW_MODEL_NAME}'")
+
+        current_version = None
+        for version in model_versions:
+            if version.run_id == run_id:
+                current_version = version.version
+                break
+
+        return {**eval_result, "candidate_version": current_version}
+
+    @task
+    def compare_with_production(register_result: dict) -> dict:
+        import mlflow
+        from mlflow.tracking import MlflowClient
+
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        client = MlflowClient()
+
+        candidate_mae = register_result["mae"]
+        candidate_rmse = register_result["rmse"]
+        candidate_r2 = register_result["r2"]
+
+        champion_mae = None
+        champion_rmse = None
+        champion_r2 = None
+        has_champion = False
+
+        try:
+            champion_version = client.get_model_version_by_alias(MLFLOW_MODEL_NAME, MLFLOW_MODEL_ALIAS)
+            champion_run = client.get_run(champion_version.run_id)
+            champion_mae = champion_run.data.metrics.get("mae")
+            champion_rmse = champion_run.data.metrics.get("rmse")
+            champion_r2 = champion_run.data.metrics.get("r2")
+            has_champion = True
+        except Exception:
+            has_champion = False
+
+        return {
+            **register_result,
+            "has_champion": has_champion,
+            "champion_mae": champion_mae,
+            "champion_rmse": champion_rmse,
+            "champion_r2": champion_r2,
+        }
+
+    @task
+    def decide_promotion(compare_result: dict) -> str:
+        has_champion = compare_result["has_champion"]
+        candidate_mae = compare_result["mae"]
+        champion_mae = compare_result.get("champion_mae")
+
+        if not has_champion:
+            return "promote_model"
+
+        if champion_mae is None:
+            return "promote_model"
+
+        improvement_pct = (champion_mae - candidate_mae) / champion_mae * 100
+
+        if improvement_pct >= MAE_IMPROVEMENT_PCT:
+            return "promote_model"
+        else:
+            return "reject_model"
+
+    @task
+    def promote_model(compare_result: dict) -> dict:
+        import mlflow
+        from mlflow.tracking import MlflowClient
+
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        client = MlflowClient()
+
+        batch_id = compare_result["batch_id"]
+        candidate_version = compare_result["candidate_version"]
+        has_champion = compare_result["has_champion"]
+        champion_mae = compare_result.get("champion_mae")
+        candidate_mae = compare_result["mae"]
+
+        if has_champion and champion_mae:
+            improvement_pct = (champion_mae - candidate_mae) / champion_mae * 100
+            reason = f"Promovido: MAE mejoró {improvement_pct:.1f}% vs champion anterior."
+        else:
+            reason = "Promovido: primer modelo, línea base inicial."
+
+        client.set_registered_model_alias(
+            name=MLFLOW_MODEL_NAME,
+            alias=MLFLOW_MODEL_ALIAS,
+            version=candidate_version,
+        )
+
+        engine = create_engine(DB_URI)
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE raw.batch_metadata
+                    SET model_promoted = TRUE,
+                        promotion_reason = :reason,
+                        model_version = :version,
+                        mae_champion = :mae,
+                        rmse_champion = :rmse,
+                        r2_champion = :r2
+                    WHERE batch_id = :bid
+                """),
+                {
+                    "reason": reason,
+                    "version": str(candidate_version),
+                    "mae": float(compare_result["mae"]),
+                    "rmse": float(compare_result["rmse"]),
+                    "r2": float(compare_result["r2"]),
+                    "bid": batch_id,
+                }
+            )
+
+            conn.execute(
+                text("""
+                    INSERT INTO monitoring.model_training_runs
+                        (run_id, model_name, model_version, batch_id,
+                         train_size, val_size, test_size,
+                         mae, rmse, mape, r2,
+                         mae_champion, rmse_champion,
+                         promoted_to_champion, promotion_reason)
+                    VALUES
+                        (:run_id, :model_name, :model_version, :batch_id,
+                         :train_size, :val_size, :test_size,
+                         :mae, :rmse, :mape, :r2,
+                         :mae_champion, :rmse_champion,
+                         TRUE, :promotion_reason)
+                """),
+                {
+                    "run_id": compare_result["run_id"],
+                    "model_name": MLFLOW_MODEL_NAME,
+                    "model_version": str(candidate_version),
+                    "batch_id": batch_id,
+                    "train_size": compare_result.get("train_size", 0),
+                    "val_size": compare_result.get("val_size", 0),
+                    "test_size": compare_result.get("test_size", 0),
+                    "mae": float(compare_result["mae"]),
+                    "rmse": float(compare_result["rmse"]),
+                    "mape": float(compare_result.get("mape", 0)),
+                    "r2": float(compare_result["r2"]),
+                    "mae_champion": float(compare_result.get("champion_mae") or compare_result["mae"]),
+                    "rmse_champion": float(compare_result.get("champion_rmse") or compare_result["rmse"]),
+                    "promotion_reason": reason,
+                }
+            )
+
+        return {**compare_result, "promoted": True, "promotion_reason": reason}
+
+    @task
+    def reject_model(compare_result: dict) -> dict:
+        batch_id = compare_result["batch_id"]
+        candidate_mae = compare_result["mae"]
+        champion_mae = compare_result.get("champion_mae", 0)
+
+        improvement_pct = (champion_mae - candidate_mae) / max(champion_mae, 1) * 100
+        reason = f"Rechazado: MAE candidato ({candidate_mae:.2f}) no mejora {MAE_IMPROVEMENT_PCT}% vs champion ({champion_mae:.2f}). Mejora: {improvement_pct:.1f}%."
+
+        engine = create_engine(DB_URI)
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE raw.batch_metadata
+                    SET model_promoted = FALSE,
+                        promotion_reason = :reason
+                    WHERE batch_id = :bid
+                """),
+                {"reason": reason, "bid": batch_id}
+            )
+
+            conn.execute(
+                text("""
+                    INSERT INTO monitoring.model_training_runs
+                        (run_id, model_name, model_version, batch_id,
+                         train_size, val_size, test_size,
+                         mae, rmse, mape, r2,
+                         mae_champion, rmse_champion,
+                         promoted_to_champion, promotion_reason)
+                    VALUES
+                        (:run_id, :model_name, :model_version, :batch_id,
+                         :train_size, :val_size, :test_size,
+                         :mae, :rmse, :mape, :r2,
+                         :mae_champion, :rmse_champion,
+                         FALSE, :promotion_reason)
+                """),
+                {
+                    "run_id": compare_result["run_id"],
+                    "model_name": MLFLOW_MODEL_NAME,
+                    "model_version": str(compare_result.get("candidate_version")),
+                    "batch_id": batch_id,
+                    "train_size": compare_result.get("train_size", 0),
+                    "val_size": compare_result.get("val_size", 0),
+                    "test_size": compare_result.get("test_size", 0),
+                    "mae": float(compare_result["mae"]),
+                    "rmse": float(compare_result["rmse"]),
+                    "mape": float(compare_result.get("mape", 0)),
+                    "r2": float(compare_result["r2"]),
+                    "mae_champion": float(compare_result.get("champion_mae") or 0),
+                    "rmse_champion": float(compare_result.get("champion_rmse") or 0),
+                    "promotion_reason": reason,
+                }
+            )
+
+        return {**compare_result, "promoted": False, "promotion_reason": reason}
+
+    @task(trigger_rule="none_failed_min_one_success")
+    def notify_or_log_result(result: dict) -> None:
+        batch_id = result.get("batch_id", "unknown")
+        trained = result.get("trained", False)
+        promoted = result.get("promoted", None)
+        reason = result.get("promotion_reason", result.get("training_reason", ""))
+
+        print(f"=== RESULTADO FINAL ===")
+        print(f"Batch ID: {batch_id}")
+        print(f"Entrenado: {trained}")
+        print(f"Promovido: {promoted}")
+        print(f"Razón: {reason}")
+
+        if trained:
+            print(f"MAE: {result.get('mae', 'N/A')}")
+            print(f"RMSE: {result.get('rmse', 'N/A')}")
+            print(f"R2: {result.get('r2', 'N/A')}")
+
+    # ─── FLUJO DEL DAG ───────────────────────────────────────────
+
+    fetch_result = fetch_batch_from_api()
+    raw_result = store_raw_batch(fetch_result)
+    schema_result = validate_schema(raw_result)
+    quality_result = validate_data_quality(schema_result)
+    categories_result = detect_new_categories(quality_result)
+    drift_result = detect_data_drift(categories_result)
+    preprocess_result = preprocess_data(drift_result)
+
+    training_branch = BranchPythonOperator(
+        task_id="decide_training",
+        python_callable=decide_training.function,
+        op_kwargs={"preprocess_result": preprocess_result},
+    )
+
+    skip_task = skip_training(preprocess_result)
+    train_task = train_candidate_model(preprocess_result)
+
+    eval_task = evaluate_candidate_model(train_task)
+    register_task = register_candidate_in_mlflow(eval_task)
+    compare_task = compare_with_production(register_task)
+
+    promotion_branch = BranchPythonOperator(
+        task_id="decide_promotion",
+        python_callable=decide_promotion.function,
+        op_kwargs={"compare_result": compare_task},
+    )
+
+    promote_task = promote_model(compare_task)
+    reject_task = reject_model(compare_task)
+
+    log_from_skip = notify_or_log_result.override(task_id="notify_from_skip")(skip_task)
+    log_from_promote = notify_or_log_result.override(task_id="notify_from_promote")(promote_task)
+    log_from_reject = notify_or_log_result.override(task_id="notify_from_reject")(reject_task)
+
+    start >> fetch_result
+    preprocess_result >> training_branch
+    training_branch >> [skip_task, train_task]
+    skip_task >> log_from_skip >> end
+    train_task >> eval_task >> register_task >> compare_task >> promotion_branch
+    promotion_branch >> [promote_task, reject_task]
+    promote_task >> log_from_promote >> end
+    reject_task >> log_from_reject >> end
+
+
+real_estate_pipeline()
