@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mlflow-config
+  namespace: mlops-pf
+data:
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  MLFLOW_EXPERIMENT_NAME: real-estate-price-prediction
+  MLFLOW_MODEL_NAME: real-estate-price-model
+  MLFLOW_MODEL_ALIAS: champion
+  MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+  MINIO_BUCKET_NAME: mlflow-artifacts

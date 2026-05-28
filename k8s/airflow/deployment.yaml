@@ -1,0 +1,240 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-webserver
+  namespace: mlops-pf
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow-webserver
+  template:
+    metadata:
+      labels:
+        app: airflow-webserver
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z postgres 5432; do
+                echo "Esperando PostgreSQL...";
+                sleep 5;
+              done
+      containers:
+        - name: airflow-webserver
+          image: jchapadockerhub/mlops-pf-airflow:latest
+          command:
+            - bash
+            - -c
+            - airflow webserver --workers 1 --worker-timeout 300
+          ports:
+            - containerPort: 8080
+          env:
+            - name: AIRFLOW_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-secret
+                  key: airflow-db-user
+            - name: AIRFLOW_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-secret
+                  key: airflow-db-password
+            - name: AIRFLOW_DB
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-secret
+                  key: airflow-db
+            - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+              value: postgresql+psycopg2://$(AIRFLOW_DB_USER):$(AIRFLOW_DB_PASSWORD)@postgres:5432/$(AIRFLOW_DB)
+            - name: AIRFLOW__CORE__EXECUTOR
+              valueFrom:
+                configMapKeyRef:
+                  name: airflow-config
+                  key: AIRFLOW__CORE__EXECUTOR
+            - name: AIRFLOW__CORE__LOAD_EXAMPLES
+              valueFrom:
+                configMapKeyRef:
+                  name: airflow-config
+                  key: AIRFLOW__CORE__LOAD_EXAMPLES
+            - name: AIRFLOW__WEBSERVER__SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-secret
+                  key: airflow-secret-key
+          volumeMounts:
+            - name: dags
+              mountPath: /opt/airflow/dags
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 3
+      volumes:
+        - name: dags
+          configMap:
+            name: airflow-dags
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-scheduler
+  namespace: mlops-pf
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow-scheduler
+  template:
+    metadata:
+      labels:
+        app: airflow-scheduler
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z postgres 5432; do
+                echo "Esperando PostgreSQL...";
+                sleep 5;
+              done
+      containers:
+        - name: airflow-scheduler
+          image: jchapadockerhub/mlops-pf-airflow:latest
+          args:
+            - scheduler
+          env:
+            - name: AIRFLOW_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-secret
+                  key: airflow-db-user
+            - name: AIRFLOW_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-secret
+                  key: airflow-db-password
+            - name: AIRFLOW_DB
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-secret
+                  key: airflow-db
+            - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+              value: postgresql+psycopg2://$(AIRFLOW_DB_USER):$(AIRFLOW_DB_PASSWORD)@postgres:5432/$(AIRFLOW_DB)
+            - name: AIRFLOW__CORE__EXECUTOR
+              valueFrom:
+                configMapKeyRef:
+                  name: airflow-config
+                  key: AIRFLOW__CORE__EXECUTOR
+            - name: AIRFLOW__CORE__LOAD_EXAMPLES
+              valueFrom:
+                configMapKeyRef:
+                  name: airflow-config
+                  key: AIRFLOW__CORE__LOAD_EXAMPLES
+            - name: AIRFLOW__WEBSERVER__SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-secret
+                  key: airflow-secret-key
+            - name: POSTGRES_HOST
+              value: postgres
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: postgres-db
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: postgres-user
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: postgres-password
+            - name: MLFLOW_TRACKING_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: mlflow-config
+                  key: MLFLOW_TRACKING_URI
+            - name: MLFLOW_EXPERIMENT_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: mlflow-config
+                  key: MLFLOW_EXPERIMENT_NAME
+            - name: MLFLOW_MODEL_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: mlflow-config
+                  key: MLFLOW_MODEL_NAME
+            - name: MLFLOW_MODEL_ALIAS
+              valueFrom:
+                configMapKeyRef:
+                  name: mlflow-config
+                  key: MLFLOW_MODEL_ALIAS
+            - name: MLFLOW_S3_ENDPOINT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: mlflow-config
+                  key: MLFLOW_S3_ENDPOINT_URL
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio-secret
+                  key: aws-access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-secret
+                  key: aws-secret-access-key
+            - name: GROUP_NUMBER
+              valueFrom:
+                configMapKeyRef:
+                  name: airflow-config
+                  key: GROUP_NUMBER
+            - name: DATA_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: airflow-config
+                  key: DATA_API_URL
+          volumeMounts:
+            - name: dags
+              mountPath: /opt/airflow/dags
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+      volumes:
+        - name: dags
+          configMap:
+            name: airflow-dags

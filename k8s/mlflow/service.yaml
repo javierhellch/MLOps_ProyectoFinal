@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow
+  namespace: mlops-pf
+spec:
+  selector:
+    app: mlflow
+  ports:
+    - name: tracking
+      port: 5000
+      targetPort: 5000
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow-external
+  namespace: mlops-pf
+spec:
+  selector:
+    app: mlflow
+  ports:
+    - name: tracking
+      port: 5050
+      targetPort: 5000
+  type: LoadBalancer
