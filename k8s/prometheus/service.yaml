@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: mlops-pf
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - port: 9090
+      targetPort: 9090
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-external
+  namespace: mlops-pf
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - port: 9090
+      targetPort: 9090
+  type: LoadBalancer

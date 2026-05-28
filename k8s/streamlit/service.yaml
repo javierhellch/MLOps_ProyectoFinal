@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: streamlit
+  namespace: mlops-pf
+spec:
+  selector:
+    app: streamlit
+  ports:
+    - port: 8501
+      targetPort: 8501
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: streamlit-external
+  namespace: mlops-pf
+spec:
+  selector:
+    app: streamlit
+  ports:
+    - port: 8501
+      targetPort: 8501
+  type: LoadBalancer

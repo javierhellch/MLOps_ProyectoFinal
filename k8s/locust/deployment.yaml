@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: locust
+  namespace: mlops-pf
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: locust
+  template:
+    metadata:
+      labels:
+        app: locust
+    spec:
+      initContainers:
+        - name: wait-for-api
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until wget -q --spider http://api:8000/health; do
+                echo "Esperando API...";
+                sleep 5;
+              done
+      containers:
+        - name: locust
+          image: jchapadockerhub/mlops-pf-locust:latest
+          ports:
+            - containerPort: 8089
+          env:
+            - name: LOCUST_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: locust-config
+                  key: LOCUST_HOST
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8089
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8089
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
