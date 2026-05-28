@@ -33,6 +33,7 @@ jobs:
         with:
           context: ./airflow
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: |
             jchapadockerhub/mlops-pf-airflow:latest
             jchapadockerhub/mlops-pf-airflow:${{ github.sha }}
@@ -42,6 +43,7 @@ jobs:
         with:
           context: ./api
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: |
             jchapadockerhub/mlops-pf-api:latest
             jchapadockerhub/mlops-pf-api:${{ github.sha }}
@@ -51,6 +53,7 @@ jobs:
         with:
           context: ./streamlit_app
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: |
             jchapadockerhub/mlops-pf-streamlit:latest
             jchapadockerhub/mlops-pf-streamlit:${{ github.sha }}
@@ -60,6 +63,7 @@ jobs:
         with:
           context: ./mlflow
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: |
             jchapadockerhub/mlops-pf-mlflow:latest
             jchapadockerhub/mlops-pf-mlflow:${{ github.sha }}
@@ -69,6 +73,7 @@ jobs:
         with:
           context: ./locust
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: |
             jchapadockerhub/mlops-pf-locust:latest
             jchapadockerhub/mlops-pf-locust:${{ github.sha }}
