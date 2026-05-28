@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: mlops-pf
+data:
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: mlops_real_estate
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: airflow-config
+  namespace: mlops-pf
+data:
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW_DB: airflow_db
+  AIRFLOW_ADMIN_EMAIL: admin@example.com
+  GROUP_NUMBER: "8"
+  DATA_API_URL: http://data-api:80
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mlflow-config
+  namespace: mlops-pf
+data:
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  MLFLOW_EXPERIMENT_NAME: real-estate-price-prediction
+  MLFLOW_MODEL_NAME: real-estate-price-model
+  MLFLOW_MODEL_ALIAS: champion
+  MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+  MINIO_BUCKET_NAME: mlflow-artifacts
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+  namespace: mlops-pf
+data:
+  API_HOST: "0.0.0.0"
+  API_PORT: "8000"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: streamlit-config
+  namespace: mlops-pf
+data:
+  API_BASE_URL: http://api:8000
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: locust-config
+  namespace: mlops-pf
+data:
+  LOCUST_HOST: http://api:8000
