@@ -7,4 +7,3 @@ scikit-learn==1.5.1
 psycopg2-binary==2.9.9
 python-dotenv==1.0.1
 prometheus-fastapi-instrumentator==6.1.0
-threading2==0.3.1
