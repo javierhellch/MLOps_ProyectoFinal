@@ -236,19 +236,32 @@ data:
     
             with engine.connect() as conn:
                 rows = conn.execute(
-                    text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid"),
-                    {"bid": batch_id}
-                ).fetchall()
+                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid"),
+                {"bid": batch_id}
+            ).fetchall()
     
             records = []
             for row in rows:
                 data = row[0]
                 if isinstance(data, str):
                     data = json.loads(data)
+                # Saltar si es header o no tiene columnas esperadas
+                if "price" not in data:
+                    continue
                 try:
                     records.append({k: float(v) if v is not None else None for k, v in data.items()})
                 except (ValueError, TypeError):
                     continue
+    
+            if not records:
+                return {
+                    **schema_result,
+                    "quality_valid": False,
+                    "quality_issues": ["No hay registros válidos en el batch"],
+                    "null_pct": 0,
+                    "duplicate_count": 0,
+                    "num_records": 0,
+                }
     
             df = pd.DataFrame(records)
     
