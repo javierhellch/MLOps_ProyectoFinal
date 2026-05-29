@@ -971,5 +971,4 @@ def real_estate_pipeline():
 
     start >> fetch_result
 
-
-dag = real_estate_pipeline()
+real_estate_dag = real_estate_pipeline()
