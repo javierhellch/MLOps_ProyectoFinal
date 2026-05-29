@@ -126,7 +126,8 @@ def real_estate_pipeline():
 
         records = []
         for i, row in enumerate(rows):
-            row_dict = {COLUMN_NAMES[j]: row[j] for j in range(len(row))}
+            row_list = list(row) if not isinstance(row, list) else row
+            row_dict = {COLUMN_NAMES[j]: row_list[j] for j in range(len(row_list))}
             row_json = json.dumps(row_dict, sort_keys=True)
             records.append({
                 "batch_id": batch_id,
