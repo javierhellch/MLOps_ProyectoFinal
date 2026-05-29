@@ -514,7 +514,7 @@ data:
                 "clean_records": len(records_to_insert),
             }
     
-        @task
+        @task.branch
         def decide_training(preprocess_result: dict) -> str:
             batch_id = preprocess_result["batch_id"]
             historical_count = preprocess_result.get("historical_count", 0)
@@ -523,7 +523,6 @@ data:
             quality_valid = preprocess_result.get("quality_valid", True)
     
             engine = create_engine(DB_URI)
-    
             with engine.connect() as conn:
                 total_clean = conn.execute(
                     text("SELECT COUNT(*) FROM clean.real_estate_clean WHERE is_valid = TRUE")
@@ -545,15 +544,15 @@ data:
                 reason = "Se entrena: drift detectado en variables relevantes."
                 should_train = True
             elif has_new_categories:
-                reason = "Se entrena: nuevas categorías detectadas con frecuencia suficiente."
+                reason = "Se entrena: nuevas categorías detectadas."
                 should_train = True
             else:
                 volume_increase = (preprocess_result.get("clean_records", 0) / max(historical_count, 1)) * 100
                 if volume_increase >= MIN_VOLUME_INCREASE_PCT:
-                    reason = f"Se entrena: volumen acumulado aumentó {volume_increase:.1f}%."
+                    reason = f"Se entrena: volumen aumentó {volume_increase:.1f}%."
                     should_train = True
                 else:
-                    reason = f"No se entrena: sin cambios significativos (volumen +{volume_increase:.1f}%, sin drift, sin nuevas categorías)."
+                    reason = f"No se entrena: sin cambios significativos."
                     should_train = False
     
             engine = create_engine(DB_URI)
@@ -769,16 +768,13 @@ data:
                 "champion_r2": champion_r2,
             }
     
-        @task
+        @task.branch
         def decide_promotion(compare_result: dict) -> str:
             has_champion = compare_result["has_champion"]
             candidate_mae = compare_result["mae"]
             champion_mae = compare_result.get("champion_mae")
     
-            if not has_champion:
-                return "promote_model"
-    
-            if champion_mae is None:
+            if not has_champion or champion_mae is None:
                 return "promote_model"
     
             improvement_pct = (champion_mae - candidate_mae) / champion_mae * 100
@@ -956,40 +952,33 @@ data:
         drift_result = detect_data_drift(categories_result)
         preprocess_result = preprocess_data(drift_result)
     
-        training_branch = BranchPythonOperator(
-            task_id="decide_training",
-            python_callable=decide_training.function,
-            op_kwargs={"preprocess_result": preprocess_result},
-        )
+        training_decision = decide_training(preprocess_result)
     
         skip_task = skip_training(preprocess_result)
         train_task = train_candidate_model(preprocess_result)
+    
+        training_decision >> [skip_task, train_task]
     
         eval_task = evaluate_candidate_model(train_task)
         register_task = register_candidate_in_mlflow(eval_task)
         compare_task = compare_with_production(register_task)
     
-        promotion_branch = BranchPythonOperator(
-            task_id="decide_promotion",
-            python_callable=decide_promotion.function,
-            op_kwargs={"compare_result": compare_task},
-        )
+        promotion_decision = decide_promotion(compare_task)
     
         promote_task = promote_model(compare_task)
         reject_task = reject_model(compare_task)
+    
+        promotion_decision >> [promote_task, reject_task]
     
         log_from_skip = notify_or_log_result.override(task_id="notify_from_skip")(skip_task)
         log_from_promote = notify_or_log_result.override(task_id="notify_from_promote")(promote_task)
         log_from_reject = notify_or_log_result.override(task_id="notify_from_reject")(reject_task)
     
+        log_from_skip >> end
+        log_from_promote >> end
+        log_from_reject >> end
+    
         start >> fetch_result
-        preprocess_result >> training_branch
-        training_branch >> [skip_task, train_task]
-        skip_task >> log_from_skip >> end
-        train_task >> eval_task >> register_task >> compare_task >> promotion_branch
-        promotion_branch >> [promote_task, reject_task]
-        promote_task >> log_from_promote >> end
-        reject_task >> log_from_reject >> end
     
     
-    real_estate_pipeline()
+    dag = real_estate_pipeline()
