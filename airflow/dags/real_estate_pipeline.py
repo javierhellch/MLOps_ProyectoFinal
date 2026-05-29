@@ -127,6 +127,9 @@ def real_estate_pipeline():
         records = []
         for i, row in enumerate(rows):
             row_list = list(row) if not isinstance(row, list) else row
+            # Saltar la primera fila si es el header
+            if i == 0 and str(row_list[0]).lower() in ['price', 'brokered_by', 'id']:
+                continue
             row_dict = {COLUMN_NAMES[j]: row_list[j] for j in range(len(row_list))}
             row_json = json.dumps(row_dict, sort_keys=True)
             records.append({
@@ -235,7 +238,10 @@ def real_estate_pipeline():
             data = row[0]
             if isinstance(data, str):
                 data = json.loads(data)
-            records.append({k: float(v) if v is not None else None for k, v in data.items()})
+            try:
+                records.append({k: float(v) if v is not None else None for k, v in data.items()})
+            except (ValueError, TypeError):
+                continue
 
         df = pd.DataFrame(records)
 
