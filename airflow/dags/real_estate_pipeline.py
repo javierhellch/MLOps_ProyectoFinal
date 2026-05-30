@@ -408,21 +408,27 @@ def real_estate_pipeline():
                 if col_drift:
                     drift_detected = True
 
+                def safe_float(v):
+                    import math
+                    if v is None or (isinstance(v, float) and math.isnan(v)):
+                        return 0.0
+                    return float(v)
+
                 drift_results[col] = {
-                    "drift_score": float(drift_score),
+                    "drift_score": safe_float(drift_score),
                     "drift_detected": col_drift,
-                    "hist_mean": float(hist_mean),
-                    "curr_mean": float(curr_mean),
+                    "hist_mean": safe_float(hist_mean),
+                    "curr_mean": safe_float(curr_mean),
                 }
 
                 drift_records.append({
                     "batch_id": batch_id,
                     "column_name": col,
-                    "mean_historical": float(hist_mean),
-                    "mean_current": float(curr_mean),
-                    "std_historical": float(hist_std),
-                    "std_current": float(curr_std),
-                    "drift_score": float(drift_score),
+                    "mean_historical": safe_float(hist_mean),
+                    "mean_current": safe_float(curr_mean),
+                    "std_historical": safe_float(hist_std),
+                    "std_current": safe_float(curr_std),
+                    "drift_score": safe_float(drift_score),
                     "drift_detected": col_drift,
                 })
 
