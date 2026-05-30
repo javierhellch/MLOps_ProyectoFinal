@@ -508,7 +508,11 @@ data:
                 ["is_valid", "anomaly_flags"]
             )
     
-            df = df[[c for c in col_order if c in df.columns]]
+            # Asegurar que todas las columnas existen con valor 0 por defecto
+            for col in COLUMN_NAMES + ["is_valid", "anomaly_flags", "batch_id", "batch_number"]:
+                if col not in df.columns:
+                    df[col] = 0
+            df = df[col_order]
             df = df.fillna(0)
     
             records_to_insert = df.to_dict(orient="records")
