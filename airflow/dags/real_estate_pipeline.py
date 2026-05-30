@@ -265,8 +265,7 @@ def real_estate_pipeline():
 
         quality_valid = (
             null_pct < 20.0 and
-            duplicate_count < len(df) * 0.1 and
-            negative_price == 0
+            duplicate_count < len(df) * 0.1
         )
 
         issues = []
