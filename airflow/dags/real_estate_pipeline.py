@@ -193,17 +193,20 @@ def real_estate_pipeline():
             data = json.loads(data)
 
         received_cols = set(data.keys())
-        expected_cols = set(COLUMN_NAMES)
-        missing_cols = expected_cols - received_cols
-        extra_cols = received_cols - expected_cols
+        essential_columns = {"price", "brokered_by", "bed", "bath", "house_size"}
+        missing_essential = essential_columns - received_cols
+        missing_cols = set(COLUMN_NAMES) - received_cols
+        extra_cols = received_cols - set(COLUMN_NAMES)
 
-        schema_valid = len(missing_cols) == 0
+        schema_valid = len(missing_essential) == 0
         issues = []
 
+        if missing_essential:
+            issues.append(f"Columnas esenciales faltantes: {missing_essential}")
         if missing_cols:
-            issues.append(f"Columnas faltantes: {missing_cols}")
+            issues.append(f"Columnas opcionales faltantes (se rellenarán con 0): {len(missing_cols)} columnas")
         if extra_cols:
-            issues.append(f"Columnas extra: {extra_cols}")
+            issues.append(f"Columnas extra ignoradas: {extra_cols}")
 
         engine = create_engine(DB_URI)
         with engine.begin() as conn:
