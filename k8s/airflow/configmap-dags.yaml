@@ -134,10 +134,12 @@ data:
             records = []
             for i, row in enumerate(rows):
                 row_list = list(row) if not isinstance(row, list) else row
-                # Saltar la primera fila si es el header
-                if i == 0 and str(row_list[0]).lower() in ['price', 'brokered_by', 'id']:
+                # Saltar filas donde los valores son nombres de columnas (header)
+                try:
+                    float(row_list[0])
+                except (ValueError, TypeError):
                     continue
-                row_dict = {COLUMN_NAMES[j]: row_list[j] for j in range(len(row_list))}
+                row_dict = {COLUMN_NAMES[j]: row_list[j] for j in range(min(len(row_list), len(COLUMN_NAMES)))}
                 row_json = json.dumps(row_dict, sort_keys=True)
                 records.append({
                     "batch_id": batch_id,
