@@ -178,7 +178,11 @@ def real_estate_pipeline():
             ).fetchone()
 
         if not sample:
-            raise ValueError(f"No se encontraron registros para batch_id={batch_id}")
+            return {
+                **raw_result,
+                "schema_valid": False,
+                "schema_issues": ["No se encontraron registros en RAW para este batch"],
+            }
 
         data = sample[0]
         if isinstance(data, str):
