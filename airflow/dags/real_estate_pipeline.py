@@ -76,6 +76,14 @@ def real_estate_pipeline():
         for attempt in range(3):
             try:
                 response = req.get(url, params=params, timeout=60)
+                if response.status_code == 400:
+                    return {
+                        "batch_id": None,
+                        "batch_number": -1,
+                        "num_records": 0,
+                        "already_processed": True,
+                        "no_more_data": True,
+                    }
                 response.raise_for_status()
                 data = response.json()
                 if not data.get("data"):
@@ -168,6 +176,12 @@ def real_estate_pipeline():
     
     @task
     def validate_schema(raw_result: dict) -> dict:
+        if not batch_id or raw_result.get("no_more_data"):
+            return {
+                **raw_result,
+                "schema_valid": False,
+                "schema_issues": ["No hay más datos disponibles en la API"],
+            }        
         batch_id = raw_result["batch_id"]
         engine = create_engine(DB_URI)
 
