@@ -122,14 +122,20 @@ def real_estate_pipeline():
         records = []
         skipped = 0
         for i, row in enumerate(rows):
-            row_list = list(row) if not isinstance(row, list) else row
-            try:
-                float(row_list[0])
-            except (ValueError, TypeError):
-                skipped += 1
-                continue
-            row_dict = {COLUMN_NAMES[j]: row_list[j] for j in range(min(len(row_list), len(COLUMN_NAMES)))}
-            row_json = json.dumps(row_dict, sort_keys=True)
+            if isinstance(row, dict):
+                # Formato diccionario - usar directamente
+                row_dict = {k: v for k, v in row.items()}
+            else:
+                # Formato lista - mapear con COLUMN_NAMES
+                row_list = list(row)
+                try:
+                    float(row_list[0])
+                except (ValueError, TypeError):
+                    skipped += 1
+                    continue
+                row_dict = {COLUMN_NAMES[j]: row_list[j] for j in range(min(len(row_list), len(COLUMN_NAMES)))}
+
+            row_json = json.dumps(row_dict, sort_keys=True, default=str)
             records.append({
                 "batch_id": batch_id,
                 "batch_number": batch_number,
