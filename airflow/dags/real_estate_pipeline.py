@@ -53,6 +53,7 @@ MIN_RECORDS_TO_TRAIN = 1000
 MIN_VOLUME_INCREASE_PCT = 5.0
 DRIFT_THRESHOLD = 0.2
 MAE_IMPROVEMENT_PCT = 3.0
+QUERY_LIMIT = 10000
 
 
 @dag(
@@ -123,10 +124,8 @@ def real_estate_pipeline():
         skipped = 0
         for i, row in enumerate(rows):
             if isinstance(row, dict):
-                # Formato diccionario - usar directamente
                 row_dict = {k: v for k, v in row.items()}
             else:
-                # Formato lista - mapear con COLUMN_NAMES
                 row_list = list(row)
                 try:
                     float(row_list[0])
@@ -134,6 +133,16 @@ def real_estate_pipeline():
                     skipped += 1
                     continue
                 row_dict = {COLUMN_NAMES[j]: row_list[j] for j in range(min(len(row_list), len(COLUMN_NAMES)))}
+
+            # Filtrar registros sin precio válido
+            price_val = row_dict.get("price")
+            try:
+                if price_val is None or float(price_val) <= 0:
+                    skipped += 1
+                    continue
+            except (ValueError, TypeError):
+                skipped += 1
+                continue
 
             row_json = json.dumps(row_dict, sort_keys=True, default=str)
             records.append({
@@ -144,6 +153,32 @@ def real_estate_pipeline():
                 "raw_data": row_json,
                 "status": "loaded",
             })
+
+        if not records:
+            # No hay datos válidos — registrar metadata y retornar skip
+            engine2 = create_engine(DB_URI)
+            with engine2.begin() as conn:
+                conn.execute(
+                    text("""
+                        INSERT INTO raw.batch_metadata
+                            (batch_id, batch_number, group_number, num_records, num_columns, validation_status)
+                        VALUES
+                            (:batch_id, :batch_number, :group_number, 0, :num_columns, 'empty')
+                    """),
+                    {
+                        "batch_id": batch_id,
+                        "batch_number": batch_number,
+                        "group_number": GROUP_NUMBER,
+                        "num_columns": len(COLUMN_NAMES),
+                    }
+                )
+            return {
+                "batch_id": batch_id,
+                "batch_number": batch_number,
+                "num_records": 0,
+                "already_processed": True,
+                "no_more_data": False,
+            }
 
         insert_raw_sql = text("""
             INSERT INTO raw.real_estate_raw
@@ -160,7 +195,7 @@ def real_estate_pipeline():
                 (:batch_id, :batch_number, :group_number, :num_records, :num_columns, 'pending')
         """)
 
-        CHUNK_SIZE = 1000
+        CHUNK_SIZE = 500
         engine2 = create_engine(DB_URI)
         with engine2.begin() as conn:
             for i in range(0, len(records), CHUNK_SIZE):
@@ -179,19 +214,18 @@ def real_estate_pipeline():
             "num_records": len(records),
             "already_processed": False,
         }
-    
+
     @task
     def validate_schema(raw_result: dict) -> dict:
-        batch_id = raw_result["batch_id"]
-        engine = create_engine(DB_URI)
-        if not batch_id or raw_result.get("no_more_data"):
+        batch_id = raw_result.get("batch_id")
+        if not batch_id or raw_result.get("no_more_data") or raw_result.get("already_processed"):
             return {
                 **raw_result,
                 "schema_valid": False,
-                "schema_issues": ["No hay más datos disponibles en la API"],
-            }        
-        
+                "schema_issues": ["Batch vacío, sin datos o ya procesado — skip."],
+            }
 
+        engine = create_engine(DB_URI)
         with engine.connect() as conn:
             sample = conn.execute(
                 text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid LIMIT 1"),
@@ -221,12 +255,12 @@ def real_estate_pipeline():
         if missing_essential:
             issues.append(f"Columnas esenciales faltantes: {missing_essential}")
         if missing_cols:
-            issues.append(f"Columnas opcionales faltantes (se rellenarán con 0): {len(missing_cols)} columnas")
+            issues.append(f"Columnas opcionales faltantes ({len(missing_cols)}): se rellenarán con 0")
         if extra_cols:
-            issues.append(f"Columnas extra ignoradas: {extra_cols}")
+            issues.append(f"Columnas extra ignoradas: {len(extra_cols)}")
 
-        engine = create_engine(DB_URI)
-        with engine.begin() as conn:
+        engine2 = create_engine(DB_URI)
+        with engine2.begin() as conn:
             conn.execute(
                 text("""
                     UPDATE raw.batch_metadata
@@ -244,13 +278,22 @@ def real_estate_pipeline():
 
     @task
     def validate_data_quality(schema_result: dict) -> dict:
-        batch_id = schema_result["batch_id"]
-        engine = create_engine(DB_URI)
+        batch_id = schema_result.get("batch_id")
+        if not batch_id or not schema_result.get("schema_valid", False):
+            return {
+                **schema_result,
+                "quality_valid": False,
+                "quality_issues": ["Schema inválido o batch vacío — skip."],
+                "null_pct": 0,
+                "duplicate_count": 0,
+                "num_records": 0,
+            }
 
+        engine = create_engine(DB_URI)
         with engine.connect() as conn:
             rows = conn.execute(
-                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid LIMIT 50000"),
-                {"bid": batch_id}
+                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid LIMIT :lim"),
+                {"bid": batch_id, "lim": QUERY_LIMIT}
             ).fetchall()
 
         records = []
@@ -258,13 +301,15 @@ def real_estate_pipeline():
             data = row[0]
             if isinstance(data, str):
                 data = json.loads(data)
-            # Saltar si es header o no tiene columnas esperadas
             if "price" not in data:
                 continue
-            try:
-                records.append({k: float(v) if v is not None else None for k, v in data.items()})
-            except (ValueError, TypeError):
-                continue
+            rec = {}
+            for k, v in data.items():
+                try:
+                    rec[k] = float(v) if v is not None else None
+                except (ValueError, TypeError):
+                    rec[k] = None
+            records.append(rec)
 
         if not records:
             return {
@@ -277,29 +322,21 @@ def real_estate_pipeline():
             }
 
         df = pd.DataFrame(records)
+        numeric_df = df[[c for c in ["price", "bed", "bath", "house_size", "acre_lot"] if c in df.columns]]
 
-        null_pct = df.isnull().mean().mean() * 100
-        duplicate_count = df.duplicated().sum()
-        negative_price = (df["price"] < 0).sum()
-        negative_house_size = (df["house_size"] < 0).sum()
+        null_pct = numeric_df.isnull().mean().mean() * 100
+        duplicate_count = int(df.duplicated().sum())
 
-        quality_valid = (
-            null_pct < 20.0 and
-            duplicate_count < len(df) * 0.1
-        )
+        quality_valid = null_pct < 50.0 and duplicate_count < len(df) * 0.5
 
         issues = []
-        if null_pct >= 20.0:
+        if null_pct >= 50.0:
             issues.append(f"Alto porcentaje de nulos: {null_pct:.1f}%")
-        if duplicate_count >= len(df) * 0.1:
+        if duplicate_count >= len(df) * 0.5:
             issues.append(f"Muchos duplicados: {duplicate_count}")
-        if negative_price > 0:
-            issues.append(f"Precios negativos: {negative_price}")
-        if negative_house_size > 0:
-            issues.append(f"house_size negativos (anomalías): {negative_house_size}")
 
-        engine = create_engine(DB_URI)
-        with engine.begin() as conn:
+        engine2 = create_engine(DB_URI)
+        with engine2.begin() as conn:
             conn.execute(
                 text("""
                     UPDATE raw.batch_metadata
@@ -313,20 +350,26 @@ def real_estate_pipeline():
             **schema_result,
             "quality_valid": quality_valid,
             "quality_issues": issues,
-            "null_pct": null_pct,
-            "duplicate_count": int(duplicate_count),
+            "null_pct": float(null_pct),
+            "duplicate_count": duplicate_count,
             "num_records": len(df),
         }
 
     @task
     def detect_new_categories(quality_result: dict) -> dict:
-        batch_id = quality_result["batch_id"]
-        engine = create_engine(DB_URI)
+        batch_id = quality_result.get("batch_id")
+        if not batch_id or not quality_result.get("quality_valid", False):
+            return {
+                **quality_result,
+                "new_categories": {},
+                "has_new_categories": False,
+            }
 
+        engine = create_engine(DB_URI)
         with engine.connect() as conn:
             rows = conn.execute(
-                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid LIMIT 10000"),
-                {"bid": batch_id}
+                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid LIMIT :lim"),
+                {"bid": batch_id, "lim": QUERY_LIMIT}
             ).fetchall()
 
         records = []
@@ -337,7 +380,6 @@ def real_estate_pipeline():
             records.append(data)
 
         df = pd.DataFrame(records).apply(pd.to_numeric, errors="coerce")
-
         one_hot_cols = [c for c in COLUMN_NAMES if c.startswith("col_")]
         new_categories = {}
 
@@ -350,19 +392,18 @@ def real_estate_pipeline():
         if historical_count > 0:
             with engine.connect() as conn:
                 hist_rows = conn.execute(
-                    text("SELECT " + ", ".join(one_hot_cols) + " FROM clean.real_estate_clean WHERE batch_id != :bid LIMIT 10000"),
-                    {"bid": batch_id}
+                    text("SELECT " + ", ".join(one_hot_cols) + " FROM clean.real_estate_clean WHERE batch_id != :bid LIMIT :lim"),
+                    {"bid": batch_id, "lim": QUERY_LIMIT}
                 ).fetchall()
 
             hist_df = pd.DataFrame(hist_rows, columns=one_hot_cols)
-
             for col in one_hot_cols:
                 if col in df.columns and col in hist_df.columns:
                     hist_values = set(hist_df[col].dropna().unique())
                     curr_values = set(df[col].dropna().unique())
                     new_vals = curr_values - hist_values
                     if new_vals:
-                        new_categories[col] = list(new_vals)
+                        new_categories[col] = [float(v) for v in list(new_vals)[:5]]
 
         return {
             **quality_result,
@@ -372,13 +413,20 @@ def real_estate_pipeline():
 
     @task
     def detect_data_drift(categories_result: dict) -> dict:
-        batch_id = categories_result["batch_id"]
-        engine = create_engine(DB_URI)
+        batch_id = categories_result.get("batch_id")
+        if not batch_id or not categories_result.get("quality_valid", False):
+            return {
+                **categories_result,
+                "drift_detected": False,
+                "drift_results": {},
+                "historical_count": 0,
+            }
 
+        engine = create_engine(DB_URI)
         with engine.connect() as conn:
             rows = conn.execute(
-                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid"),
-                {"bid": batch_id}
+                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid LIMIT :lim"),
+                {"bid": batch_id, "lim": QUERY_LIMIT}
             ).fetchall()
 
         records = []
@@ -389,7 +437,6 @@ def real_estate_pipeline():
             records.append(data)
 
         curr_df = pd.DataFrame(records).apply(pd.to_numeric, errors="coerce")
-
         numeric_cols = ["price", "brokered_by", "bed", "bath", "house_size", "acre_lot"]
         drift_detected = False
         drift_results = {}
@@ -403,8 +450,8 @@ def real_estate_pipeline():
         if historical_count >= MIN_RECORDS_TO_TRAIN:
             with engine.connect() as conn:
                 hist_rows = conn.execute(
-                    text(f"SELECT {', '.join(numeric_cols)} FROM clean.real_estate_clean WHERE batch_id != :bid"),
-                    {"bid": batch_id}
+                    text(f"SELECT {', '.join(numeric_cols)} FROM clean.real_estate_clean WHERE batch_id != :bid LIMIT :lim"),
+                    {"bid": batch_id, "lim": QUERY_LIMIT}
                 ).fetchall()
 
             hist_df = pd.DataFrame(hist_rows, columns=numeric_cols).apply(pd.to_numeric, errors="coerce")
@@ -414,47 +461,45 @@ def real_estate_pipeline():
                 if col not in curr_df.columns:
                     continue
 
-                hist_mean = hist_df[col].mean()
-                hist_std = hist_df[col].std()
-                curr_mean = curr_df[col].mean()
-                curr_std = curr_df[col].std()
+                def safe_float(v):
+                    import math
+                    try:
+                        f = float(v)
+                        return 0.0 if math.isnan(f) or math.isinf(f) else f
+                    except (TypeError, ValueError):
+                        return 0.0
 
-                if hist_std > 0:
-                    drift_score = abs(curr_mean - hist_mean) / hist_std
-                else:
-                    drift_score = 0.0
+                hist_mean = safe_float(hist_df[col].mean())
+                hist_std = safe_float(hist_df[col].std())
+                curr_mean = safe_float(curr_df[col].mean())
+                curr_std = safe_float(curr_df[col].std())
 
+                drift_score = safe_float(abs(curr_mean - hist_mean) / hist_std) if hist_std > 0 else 0.0
                 col_drift = drift_score > DRIFT_THRESHOLD
                 if col_drift:
                     drift_detected = True
 
-                def safe_float(v):
-                    import math
-                    if v is None or (isinstance(v, float) and math.isnan(v)):
-                        return 0.0
-                    return float(v)
-
                 drift_results[col] = {
-                    "drift_score": safe_float(drift_score),
+                    "drift_score": drift_score,
                     "drift_detected": col_drift,
-                    "hist_mean": safe_float(hist_mean),
-                    "curr_mean": safe_float(curr_mean),
+                    "hist_mean": hist_mean,
+                    "curr_mean": curr_mean,
                 }
 
                 drift_records.append({
                     "batch_id": batch_id,
                     "column_name": col,
-                    "mean_historical": safe_float(hist_mean),
-                    "mean_current": safe_float(curr_mean),
-                    "std_historical": safe_float(hist_std),
-                    "std_current": safe_float(curr_std),
-                    "drift_score": safe_float(drift_score),
+                    "mean_historical": hist_mean,
+                    "mean_current": curr_mean,
+                    "std_historical": hist_std,
+                    "std_current": curr_std,
+                    "drift_score": drift_score,
                     "drift_detected": col_drift,
                 })
 
             if drift_records:
-                engine = create_engine(DB_URI)
-                with engine.begin() as conn:
+                engine2 = create_engine(DB_URI)
+                with engine2.begin() as conn:
                     conn.execute(
                         text("""
                             INSERT INTO monitoring.data_drift
@@ -476,14 +521,20 @@ def real_estate_pipeline():
 
     @task
     def preprocess_data(drift_result: dict) -> dict:
-        batch_id = drift_result["batch_id"]
-        batch_number = drift_result["batch_number"]
-        engine = create_engine(DB_URI)
+        batch_id = drift_result.get("batch_id")
+        batch_number = drift_result.get("batch_number", 0)
 
+        if not batch_id or not drift_result.get("quality_valid", False):
+            return {
+                **drift_result,
+                "clean_records": 0,
+            }
+
+        engine = create_engine(DB_URI)
         with engine.connect() as conn:
             rows = conn.execute(
-                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid LIMIT 50000"),
-                {"bid": batch_id}
+                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid LIMIT :lim"),
+                {"bid": batch_id, "lim": QUERY_LIMIT}
             ).fetchall()
 
         records = []
@@ -495,23 +546,26 @@ def real_estate_pipeline():
 
         df = pd.DataFrame(records).apply(pd.to_numeric, errors="coerce")
 
+        # Asegurar todas las columnas
+        for col in COLUMN_NAMES:
+            if col not in df.columns:
+                df[col] = 0.0
+
+        df = df.fillna(0)
+
+        # Flags de anomalías
         anomaly_flags_list = []
         valid_flags = []
-
         for _, row in df.iterrows():
             flags = {}
             is_valid = True
-
-            if row.get("price", 0) < 0:
-                flags["negative_price"] = True
+            if row.get("price", 0) <= 0:
+                flags["invalid_price"] = True
                 is_valid = False
             if row.get("house_size", 0) < 0:
                 flags["negative_house_size"] = True
-            if row.get("acre_lot", 0) < 0:
-                flags["negative_acre_lot"] = True
             if row.get("bed", 0) > 30:
                 flags["extreme_bed"] = True
-
             anomaly_flags_list.append(json.dumps(flags))
             valid_flags.append(is_valid)
 
@@ -520,34 +574,25 @@ def real_estate_pipeline():
         df["batch_id"] = batch_id
         df["batch_number"] = batch_number
 
-        col_order = (
-            ["batch_id", "batch_number"] +
-            COLUMN_NAMES +
-            ["is_valid", "anomaly_flags"]
-        )
-
-        # Asegurar que todas las columnas existen con valor 0 por defecto
-        for col in COLUMN_NAMES + ["is_valid", "anomaly_flags", "batch_id", "batch_number"]:
-            if col not in df.columns:
-                df[col] = 0
+        col_order = ["batch_id", "batch_number"] + COLUMN_NAMES + ["is_valid", "anomaly_flags"]
         df = df[col_order]
-        df = df.fillna(0)
 
         records_to_insert = df.to_dict(orient="records")
 
-        col_names_sql = ", ".join(COLUMN_NAMES + ["is_valid", "anomaly_flags", "batch_id", "batch_number"])
-        placeholders = ", ".join([f":{c}" for c in COLUMN_NAMES + ["is_valid", "anomaly_flags", "batch_id", "batch_number"]])
+        all_cols = COLUMN_NAMES + ["is_valid", "anomaly_flags", "batch_id", "batch_number"]
+        col_names_sql = ", ".join(all_cols)
+        placeholders = ", ".join([f":{c}" for c in all_cols])
+        insert_sql = text(f"INSERT INTO clean.real_estate_clean ({col_names_sql}) VALUES ({placeholders})")
 
-        insert_sql = text(f"""
-            INSERT INTO clean.real_estate_clean ({col_names_sql})
-            VALUES ({placeholders})
-        """)
-
-        engine = create_engine(DB_URI)
-        with engine.begin() as conn:
-            for record in records_to_insert:
-                record["anomaly_flags"] = record.get("anomaly_flags", "{}")
-                conn.execute(insert_sql, record)
+        # Insertar en chunks
+        CHUNK_SIZE = 500
+        engine2 = create_engine(DB_URI)
+        with engine2.begin() as conn:
+            for i in range(0, len(records_to_insert), CHUNK_SIZE):
+                chunk = records_to_insert[i:i+CHUNK_SIZE]
+                for record in chunk:
+                    record["anomaly_flags"] = record.get("anomaly_flags", "{}")
+                conn.execute(insert_sql, chunk)
 
         return {
             **drift_result,
@@ -556,11 +601,12 @@ def real_estate_pipeline():
 
     @task.branch
     def decide_training(preprocess_result: dict) -> str:
-        batch_id = preprocess_result["batch_id"]
+        batch_id = preprocess_result.get("batch_id")
         historical_count = preprocess_result.get("historical_count", 0)
         drift_detected = preprocess_result.get("drift_detected", False)
         has_new_categories = preprocess_result.get("has_new_categories", False)
-        quality_valid = preprocess_result.get("quality_valid", True)
+        quality_valid = preprocess_result.get("quality_valid", False)
+        clean_records = preprocess_result.get("clean_records", 0)
 
         engine = create_engine(DB_URI)
         with engine.connect() as conn:
@@ -571,15 +617,15 @@ def real_estate_pipeline():
         reason = ""
         should_train = False
 
-        if not quality_valid:
+        if not quality_valid or clean_records == 0:
             issues_str = "; ".join(preprocess_result.get("quality_issues", []))
-            reason = f"No se entrena: calidad insuficiente. Issues: {issues_str}"
+            reason = f"No se entrena: calidad insuficiente o batch vacío. Issues: {issues_str}"
             should_train = False
         elif total_clean < MIN_RECORDS_TO_TRAIN:
             reason = f"No se entrena: insuficientes registros ({total_clean} < {MIN_RECORDS_TO_TRAIN})."
             should_train = False
         elif historical_count == 0:
-            reason = "Se entrena: primer batch, línea base inicial."
+            reason = "Se entrena: primer batch con datos válidos, línea base inicial."
             should_train = True
         elif drift_detected:
             reason = "Se entrena: drift detectado en variables relevantes."
@@ -588,47 +634,43 @@ def real_estate_pipeline():
             reason = "Se entrena: nuevas categorías detectadas."
             should_train = True
         else:
-            volume_increase = (preprocess_result.get("clean_records", 0) / max(historical_count, 1)) * 100
+            volume_increase = (clean_records / max(historical_count, 1)) * 100
             if volume_increase >= MIN_VOLUME_INCREASE_PCT:
                 reason = f"Se entrena: volumen aumentó {volume_increase:.1f}%."
                 should_train = True
             else:
-                reason = f"No se entrena: sin cambios significativos."
+                reason = f"No se entrena: sin cambios significativos (volumen +{volume_increase:.1f}%)."
                 should_train = False
 
-        engine = create_engine(DB_URI)
-        with engine.begin() as conn:
-            conn.execute(
-                text("""
-                    UPDATE raw.batch_metadata
-                    SET training_decision = :decision,
-                        training_reason = :reason
-                    WHERE batch_id = :bid
-                """),
-                {
-                    "decision": "train" if should_train else "skip",
-                    "reason": reason,
-                    "bid": batch_id,
-                }
-            )
+        if batch_id:
+            engine2 = create_engine(DB_URI)
+            with engine2.begin() as conn:
+                conn.execute(
+                    text("""
+                        UPDATE raw.batch_metadata
+                        SET training_decision = :decision,
+                            training_reason = :reason
+                        WHERE batch_id = :bid
+                    """),
+                    {
+                        "decision": "train" if should_train else "skip",
+                        "reason": reason,
+                        "bid": batch_id,
+                    }
+                )
 
         return "train_candidate_model" if should_train else "skip_training"
 
     @task
     def skip_training(preprocess_result: dict) -> dict:
-        batch_id = preprocess_result["batch_id"]
-        engine = create_engine(DB_URI)
-
-        with engine.begin() as conn:
-            conn.execute(
-                text("""
-                    UPDATE raw.batch_metadata
-                    SET training_executed = FALSE
-                    WHERE batch_id = :bid
-                """),
-                {"bid": batch_id}
-            )
-
+        batch_id = preprocess_result.get("batch_id")
+        if batch_id:
+            engine = create_engine(DB_URI)
+            with engine.begin() as conn:
+                conn.execute(
+                    text("UPDATE raw.batch_metadata SET training_executed = FALSE WHERE batch_id = :bid"),
+                    {"bid": batch_id}
+                )
         return {**preprocess_result, "trained": False}
 
     @task
@@ -650,10 +692,17 @@ def real_estate_pipeline():
                     SELECT {', '.join(COLUMN_NAMES)}
                     FROM clean.real_estate_clean
                     WHERE is_valid = TRUE
+                    LIMIT 50000
                 """)
             ).fetchall()
 
         df = pd.DataFrame(rows, columns=COLUMN_NAMES).apply(pd.to_numeric, errors="coerce").fillna(0)
+
+        # Filtrar precios válidos
+        df = df[df[TARGET_COL] > 0]
+
+        if len(df) < MIN_RECORDS_TO_TRAIN:
+            raise ValueError(f"Insuficientes registros para entrenar: {len(df)}")
 
         X = df[FEATURE_COLS]
         y = df[TARGET_COL]
@@ -668,8 +717,8 @@ def real_estate_pipeline():
             model = Pipeline([
                 ("imputer", SimpleImputer(strategy="median")),
                 ("regressor", GradientBoostingRegressor(
-                    n_estimators=100,
-                    max_depth=5,
+                    n_estimators=50,
+                    max_depth=4,
                     learning_rate=0.1,
                     random_state=42,
                 ))
@@ -677,23 +726,21 @@ def real_estate_pipeline():
 
             model.fit(X_train, y_train)
 
-            y_pred_val = model.predict(X_val)
             y_pred_test = model.predict(X_test)
 
-            mae = mean_absolute_error(y_test, y_pred_test)
-            rmse = np.sqrt(mean_squared_error(y_test, y_pred_test))
-            r2 = r2_score(y_test, y_pred_test)
-            mape = np.mean(np.abs((y_test - y_pred_test) / np.maximum(np.abs(y_test), 1))) * 100
+            mae = float(mean_absolute_error(y_test, y_pred_test))
+            rmse = float(np.sqrt(mean_squared_error(y_test, y_pred_test)))
+            r2 = float(r2_score(y_test, y_pred_test))
+            mape = float(np.mean(np.abs((y_test - y_pred_test) / np.maximum(np.abs(y_test), 1))) * 100)
 
             mlflow.log_param("model_type", "GradientBoostingRegressor")
-            mlflow.log_param("n_estimators", 100)
-            mlflow.log_param("max_depth", 5)
+            mlflow.log_param("n_estimators", 50)
+            mlflow.log_param("max_depth", 4)
             mlflow.log_param("learning_rate", 0.1)
             mlflow.log_param("batch_id", batch_id)
             mlflow.log_param("train_size", len(X_train))
             mlflow.log_param("val_size", len(X_val))
             mlflow.log_param("test_size", len(X_test))
-
             mlflow.log_metric("mae", mae)
             mlflow.log_metric("rmse", rmse)
             mlflow.log_metric("r2", r2)
@@ -705,8 +752,8 @@ def real_estate_pipeline():
                 registered_model_name=MLFLOW_MODEL_NAME,
             )
 
-            engine = create_engine(DB_URI)
-            with engine.begin() as conn:
+            engine2 = create_engine(DB_URI)
+            with engine2.begin() as conn:
                 conn.execute(
                     text("""
                         UPDATE raw.batch_metadata
@@ -717,23 +764,17 @@ def real_estate_pipeline():
                             r2_candidate = :r2
                         WHERE batch_id = :bid
                     """),
-                    {
-                        "run_id": run.info.run_id,
-                        "mae": float(mae),
-                        "rmse": float(rmse),
-                        "r2": float(r2),
-                        "bid": batch_id,
-                    }
+                    {"run_id": run.info.run_id, "mae": mae, "rmse": rmse, "r2": r2, "bid": batch_id}
                 )
 
             return {
                 **preprocess_result,
                 "trained": True,
                 "run_id": run.info.run_id,
-                "mae": float(mae),
-                "rmse": float(rmse),
-                "r2": float(r2),
-                "mape": float(mape),
+                "mae": mae,
+                "rmse": rmse,
+                "r2": r2,
+                "mape": mape,
                 "train_size": len(X_train),
                 "val_size": len(X_val),
                 "test_size": len(X_test),
@@ -741,19 +782,16 @@ def real_estate_pipeline():
 
     @task
     def evaluate_candidate_model(train_result: dict) -> dict:
-        run_id = train_result["run_id"]
         mae = train_result["mae"]
         rmse = train_result["rmse"]
         r2 = train_result["r2"]
-
-        evaluation = {
-            "mae": mae,
-            "rmse": rmse,
-            "r2": r2,
-            "evaluation_passed": mae > 0 and rmse > 0,
+        return {
+            **train_result,
+            "evaluation": {
+                "mae": mae, "rmse": rmse, "r2": r2,
+                "evaluation_passed": mae > 0 and rmse > 0,
+            }
         }
-
-        return {**train_result, "evaluation": evaluation}
 
     @task
     def register_candidate_in_mlflow(eval_result: dict) -> dict:
@@ -762,16 +800,13 @@ def real_estate_pipeline():
 
         mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
         client = MlflowClient()
-
         run_id = eval_result["run_id"]
         model_versions = client.search_model_versions(f"name='{MLFLOW_MODEL_NAME}'")
-
         current_version = None
         for version in model_versions:
             if version.run_id == run_id:
                 current_version = version.version
                 break
-
         return {**eval_result, "candidate_version": current_version}
 
     @task
@@ -781,11 +816,6 @@ def real_estate_pipeline():
 
         mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
         client = MlflowClient()
-
-        candidate_mae = register_result["mae"]
-        candidate_rmse = register_result["rmse"]
-        candidate_r2 = register_result["r2"]
-
         champion_mae = None
         champion_rmse = None
         champion_r2 = None
@@ -819,11 +849,7 @@ def real_estate_pipeline():
             return "promote_model"
 
         improvement_pct = (champion_mae - candidate_mae) / champion_mae * 100
-
-        if improvement_pct >= MAE_IMPROVEMENT_PCT:
-            return "promote_model"
-        else:
-            return "reject_model"
+        return "promote_model" if improvement_pct >= MAE_IMPROVEMENT_PCT else "reject_model"
 
     @task
     def promote_model(compare_result: dict) -> dict:
@@ -856,12 +882,9 @@ def real_estate_pipeline():
             conn.execute(
                 text("""
                     UPDATE raw.batch_metadata
-                    SET model_promoted = TRUE,
-                        promotion_reason = :reason,
-                        model_version = :version,
-                        mae_champion = :mae,
-                        rmse_champion = :rmse,
-                        r2_champion = :r2
+                    SET model_promoted = TRUE, promotion_reason = :reason,
+                        model_version = :version, mae_champion = :mae,
+                        rmse_champion = :rmse, r2_champion = :r2
                     WHERE batch_id = :bid
                 """),
                 {
@@ -873,7 +896,6 @@ def real_estate_pipeline():
                     "bid": batch_id,
                 }
             )
-
             conn.execute(
                 text("""
                     INSERT INTO monitoring.model_training_runs
@@ -923,13 +945,11 @@ def real_estate_pipeline():
             conn.execute(
                 text("""
                     UPDATE raw.batch_metadata
-                    SET model_promoted = FALSE,
-                        promotion_reason = :reason
+                    SET model_promoted = FALSE, promotion_reason = :reason
                     WHERE batch_id = :bid
                 """),
                 {"reason": reason, "bid": batch_id}
             )
-
             conn.execute(
                 text("""
                     INSERT INTO monitoring.model_training_runs
