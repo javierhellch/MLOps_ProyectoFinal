@@ -75,40 +75,27 @@ data:
         end = EmptyOperator(task_id="end", trigger_rule="none_failed_min_one_success")
     
         @task
-        def fetch_batch_from_api() -> dict:
+        def fetch_and_store_batch() -> dict:
+            import requests as req
             url = f"{DATA_API_URL}/data"
             params = {"group_number": GROUP_NUMBER}
     
             for attempt in range(3):
                 try:
-                    response = requests.get(url, params=params, timeout=30)
+                    response = req.get(url, params=params, timeout=60)
                     response.raise_for_status()
                     data = response.json()
-    
                     if not data.get("data"):
                         raise ValueError("La API retornó datos vacíos.")
-    
-                    batch_number = data["batch_number"]
-                    rows = data["data"]
-    
-                    return {
-                        "batch_number": batch_number,
-                        "group_number": GROUP_NUMBER,
-                        "num_records": len(rows),
-                        "num_columns": len(rows[0]) if rows else 0,
-                        "rows": rows,
-                    }
-    
+                    break
                 except Exception as e:
                     if attempt == 2:
-                        raise RuntimeError(f"Error al consumir la API después de 3 intentos: {e}")
+                        raise RuntimeError(f"Error al consumir la API: {e}")
                     import time
                     time.sleep(5)
     
-        @task
-        def store_raw_batch(batch_info: dict) -> dict:
-            rows = batch_info["rows"]
-            batch_number = batch_info["batch_number"]
+            rows = data["data"]
+            batch_number = data["batch_number"]
             batch_id = f"batch_{GROUP_NUMBER}_{batch_number}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
     
             engine = create_engine(DB_URI)
@@ -127,17 +114,18 @@ data:
                     return {
                         "batch_id": existing_batch,
                         "batch_number": batch_number,
-                        "num_records": batch_info["num_records"],
+                        "num_records": 0,
                         "already_processed": True,
                     }
     
             records = []
+            skipped = 0
             for i, row in enumerate(rows):
                 row_list = list(row) if not isinstance(row, list) else row
-                # Saltar filas donde los valores son nombres de columnas (header)
                 try:
                     float(row_list[0])
                 except (ValueError, TypeError):
+                    skipped += 1
                     continue
                 row_dict = {COLUMN_NAMES[j]: row_list[j] for j in range(min(len(row_list), len(COLUMN_NAMES)))}
                 row_json = json.dumps(row_dict, sort_keys=True)
@@ -165,24 +153,26 @@ data:
                     (:batch_id, :batch_number, :group_number, :num_records, :num_columns, 'pending')
             """)
     
-            engine = create_engine(DB_URI)
-            with engine.begin() as conn:
-                conn.execute(insert_raw_sql, records)
+            CHUNK_SIZE = 1000
+            engine2 = create_engine(DB_URI)
+            with engine2.begin() as conn:
+                for i in range(0, len(records), CHUNK_SIZE):
+                    conn.execute(insert_raw_sql, records[i:i+CHUNK_SIZE])
                 conn.execute(insert_meta_sql, {
                     "batch_id": batch_id,
                     "batch_number": batch_number,
                     "group_number": GROUP_NUMBER,
-                    "num_records": batch_info["num_records"],
-                    "num_columns": batch_info["num_columns"],
+                    "num_records": len(records),
+                    "num_columns": len(COLUMN_NAMES),
                 })
     
             return {
                 "batch_id": batch_id,
                 "batch_number": batch_number,
-                "num_records": batch_info["num_records"],
+                "num_records": len(records),
                 "already_processed": False,
             }
-    
+        
         @task
         def validate_schema(raw_result: dict) -> dict:
             batch_id = raw_result["batch_id"]
@@ -976,8 +966,7 @@ data:
     
         # ─── FLUJO DEL DAG ───────────────────────────────────────────
     
-        fetch_result = fetch_batch_from_api()
-        raw_result = store_raw_batch(fetch_result)
+        raw_result = fetch_and_store_batch()
         schema_result = validate_schema(raw_result)
         quality_result = validate_data_quality(schema_result)
         categories_result = detect_new_categories(quality_result)
