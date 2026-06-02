@@ -234,9 +234,9 @@ def real_estate_pipeline():
 
         with engine.connect() as conn:
             rows = conn.execute(
-            text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid"),
-            {"bid": batch_id}
-        ).fetchall()
+                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid LIMIT 50000"),
+                {"bid": batch_id}
+            ).fetchall()
 
         records = []
         for row in rows:
@@ -467,7 +467,7 @@ def real_estate_pipeline():
 
         with engine.connect() as conn:
             rows = conn.execute(
-                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid"),
+                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid LIMIT 50000"),
                 {"bid": batch_id}
             ).fetchall()
 
