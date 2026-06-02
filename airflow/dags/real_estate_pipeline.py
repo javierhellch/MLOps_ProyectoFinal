@@ -176,14 +176,15 @@ def real_estate_pipeline():
     
     @task
     def validate_schema(raw_result: dict) -> dict:
+        batch_id = raw_result["batch_id"]
+        engine = create_engine(DB_URI)
         if not batch_id or raw_result.get("no_more_data"):
             return {
                 **raw_result,
                 "schema_valid": False,
                 "schema_issues": ["No hay más datos disponibles en la API"],
             }        
-        batch_id = raw_result["batch_id"]
-        engine = create_engine(DB_URI)
+        
 
         with engine.connect() as conn:
             sample = conn.execute(
