@@ -325,7 +325,7 @@ def real_estate_pipeline():
 
         with engine.connect() as conn:
             rows = conn.execute(
-                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid"),
+                text("SELECT raw_data FROM raw.real_estate_raw WHERE batch_id = :bid LIMIT 10000"),
                 {"bid": batch_id}
             ).fetchall()
 
@@ -350,7 +350,7 @@ def real_estate_pipeline():
         if historical_count > 0:
             with engine.connect() as conn:
                 hist_rows = conn.execute(
-                    text("SELECT " + ", ".join(one_hot_cols) + " FROM clean.real_estate_clean WHERE batch_id != :bid"),
+                    text("SELECT " + ", ".join(one_hot_cols) + " FROM clean.real_estate_clean WHERE batch_id != :bid LIMIT 10000"),
                     {"bid": batch_id}
                 ).fetchall()
 
