@@ -992,6 +992,6 @@ def real_estate_pipeline():
     log_from_promote >> end
     log_from_reject >> end
 
-    start >> fetch_result
+    start >> raw_result
 
 real_estate_dag = real_estate_pipeline()
