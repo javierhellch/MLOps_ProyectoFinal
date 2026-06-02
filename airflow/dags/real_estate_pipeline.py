@@ -572,7 +572,8 @@ def real_estate_pipeline():
         should_train = False
 
         if not quality_valid:
-            reason = "No se entrena: datos con problemas de calidad críticos."
+            issues_str = "; ".join(preprocess_result.get("quality_issues", []))
+            reason = f"No se entrena: calidad insuficiente. Issues: {issues_str}"
             should_train = False
         elif total_clean < MIN_RECORDS_TO_TRAIN:
             reason = f"No se entrena: insuficientes registros ({total_clean} < {MIN_RECORDS_TO_TRAIN})."
