@@ -8,6 +8,8 @@ El stack está desplegado completamente en **Kubernetes** (Docker Desktop), con 
 
 ## 1. Arquitectura general
 
+![alt text](/images/Architecture.png)
+
 ```text
 Developer (push a main)
         ↓
