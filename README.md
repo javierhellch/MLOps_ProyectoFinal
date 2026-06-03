@@ -755,6 +755,8 @@ Abrir http://localhost:9090 → Status → Targets.
 
 El target `api` debe aparecer como **UP**.
 
+![alt text](/images/prometheus_targets.png)
+
 ### 15.9. Validar Grafana
 
 Abrir http://localhost:3000 con `admin / admin`.
@@ -763,6 +765,8 @@ El dashboard incluye: total de solicitudes, RPS, latencia promedio, p95, p99, ta
 
 Durante la prueba de Locust, los paneles deben mostrar el aumento en tráfico y latencia en tiempo real.
 
+![alt text](/images/grafana_dashboard.png)
+
 ### 15.10. Validar GitHub Actions
 
 ```text
@@ -770,6 +774,8 @@ https://github.com/javierhellch/MLOps_ProyectoFinal/actions
 ```
 
 Verificar que el último workflow completó con estado **passed ✅** y que las imágenes están publicadas en DockerHub.
+
+![alt text](/images/github_action1.png)
 
 ### 15.11. Validar Argo CD
 
