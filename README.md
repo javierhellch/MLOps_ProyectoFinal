@@ -266,6 +266,8 @@ airflow-config:
 
 Las imágenes se construyen automáticamente al hacer `push` a `main` mediante GitHub Actions. El workflow construye en multi-plataforma (`linux/amd64` + `linux/arm64`).
 
+![alt text](/images/dockerhub.png)
+
 ---
 
 ## 9. Requisitos previos
@@ -281,6 +283,8 @@ Verificar:
 kubectl config current-context   # debe ser docker-desktop
 kubectl get nodes                 # debe mostrar docker-desktop Ready
 ```
+
+![alt text](/images/context.png)
 
 ---
 
@@ -302,13 +306,19 @@ kubectl wait --for=condition=available deployment/argocd-server -n argocd --time
 kubectl port-forward svc/argocd-server -n argocd 8080:443
 ```
 
+![alt text](/images/argo_pods.png)
+
 Obtener la contraseña inicial:
 
 ```bash
 kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
 ```
 
+![alt text](/images/argo_pass.png)
+
 Acceder en http://localhost:8080 con usuario `admin`.
+
+![alt text](/images/argo1.png)
 
 ### 10.3. Aplicar manifiestos base
 
@@ -317,6 +327,8 @@ kubectl apply -f k8s/namespace.yaml
 kubectl apply -f k8s/secrets/
 kubectl apply -f k8s/configmaps/
 ```
+
+![alt text](/images/secrets_configmaps.png)
 
 ### 10.4. Levantar infraestructura base
 
@@ -329,6 +341,8 @@ kubectl apply -f k8s/mlflow/
 kubectl wait --for=condition=ready pod -l app=mlflow -n mlops-pf --timeout=120s
 ```
 
+![alt text](/images/base_services.png)
+
 ### 10.5. Inicializar y levantar Airflow
 
 ```bash
@@ -338,6 +352,8 @@ kubectl wait --for=condition=ready pod -l app=airflow-webserver -n mlops-pf --ti
 kubectl wait --for=condition=ready pod -l app=airflow-scheduler -n mlops-pf --timeout=120s
 ```
 
+![alt text](/images/airflow_service.png)
+
 ### 10.6. Levantar Data API
 
 ```bash
@@ -345,13 +361,18 @@ kubectl apply -f k8s/data-api/
 kubectl wait --for=condition=ready pod -l app=data-api -n mlops-pf --timeout=120s
 ```
 
+![alt text](/images/dataapi_service.png)
+
 ### 10.7. Configurar Argo CD
 
 ```bash
 kubectl apply -f k8s/argocd/application.yaml
 ```
+![alt text](/images/argo_config.png)
 
 Desde la UI de Argo CD (http://localhost:8080), verificar que la app `mlops-pf` aparece como **Synced + Healthy**.
+
+![alt text](/images/argo.png)
 
 A partir de este punto, cualquier `push` a `main` que modifique el directorio `k8s/` será detectado por Argo CD y aplicado automáticamente al clúster.
 
@@ -364,6 +385,22 @@ A partir de este punto, cualquier `push` a `main` que modifique el directorio `k
 5. Presionar **Trigger DAG**
 6. Esperar que todas las tareas queden en verde
 
+![alt text](/images/airflow_dag.png)
+
+#Primera ejecución
+
+![alt text](/images/airflow_run1.png)
+
+![alt text](/images/postgres_run1.png)
+
+#Segunda ejecución
+
+![alt text](/images/airflow_run2.png)
+
+#Tercera ejecución
+
+![alt text](/images/airflow_run3.png)
+
 Verificar en PostgreSQL:
 
 ```bash
@@ -371,6 +408,12 @@ kubectl exec -n mlops-pf $(kubectl get pod -n mlops-pf -l app=postgres -o jsonpa
   psql -U mlops_user -d mlops_real_estate -c \
   "SELECT batch_number, num_records, training_decision, training_reason, training_executed, model_promoted FROM raw.batch_metadata ORDER BY ingestion_timestamp DESC LIMIT 5;"
 ```
+
+![alt text](/images/postgres_run1.png)
+
+![alt text](/images/postgres_run2.png)
+
+![alt text](/images/postgres_run3.png)
 
 Ejecutar el DAG **al menos 2 veces** para tener datos históricos y evidenciar la lógica de promoción.
 
@@ -400,6 +443,8 @@ kubectl exec -n mlops-pf $(kubectl get pod -n mlops-pf -l app=postgres -o jsonpa
 
 Una vez exista un modelo `champion` en MLflow:
 
+![alt text](/images/mlflow_champion.png)
+
 ```bash
 kubectl apply -f k8s/api/
 kubectl apply -f k8s/streamlit/
@@ -407,6 +452,8 @@ kubectl apply -f k8s/locust/
 kubectl apply -f k8s/prometheus/
 kubectl apply -f k8s/grafana/
 ```
+
+![alt text](/images/inferenceapi_and_OServices.png)
 
 Si la API arrancó antes de que existiera el modelo champion, reiniciarla:
 
@@ -433,11 +480,15 @@ DOCKERHUB_USERNAME
 DOCKERHUB_TOKEN
 ```
 
+![alt text](/images/dockerhub_token.png)
+
 Verificar el estado de los workflows en:
 
 ```text
 https://github.com/javierhellch/MLOps_ProyectoFinal/actions
 ```
+
+![alt text](/images/github_actions.png)
 
 ---
 
@@ -451,7 +502,9 @@ Verificar el estado de sincronización:
 kubectl get application -n argocd
 ```
 
-Forzar sincronización manual:
+![alt text](/images/argo_status.png)
+
+Forzar sincronización manual (de ser necesario):
 
 ```bash
 kubectl -n argocd patch application mlops-pf --type merge \
@@ -515,6 +568,8 @@ El modelo candidato se promueve como `champion` si su MAE mejora **al menos 3%**
 
 ---
 
+![alt text](/images/airflow_dagmap.png)
+
 ## 14. Data API — Fuente de datos
 
 La Data API (`cristiandiaz13/mlops-puj:data-api-pf-v1`) se despliega en el clúster como Deployment. Devuelve batches de datos inmobiliarios en formato variable.
@@ -530,6 +585,8 @@ El DAG maneja automáticamente el código 400 (sin más batches) retornando un s
 
 Importante: el reinicio debe hacerse desde **dentro del clúster** (no desde localhost), ya que la API mantiene estado por instancia.
 
+![alt text](/images/data_api.png)
+
 ---
 
 ## 15. Validación del sistema
@@ -539,6 +596,8 @@ Importante: el reinicio debe hacerse desde **dentro del clúster** (no desde loc
 ```bash
 kubectl get pods -n mlops-pf
 ```
+
+![alt text](/images/pods_ok1.png)
 
 ### 15.2. Verificar datos en PostgreSQL
 
@@ -554,6 +613,8 @@ kubectl exec -n mlops-pf $(kubectl get pod -n mlops-pf -l app=postgres -o jsonpa
   SELECT 'inference_logs', COUNT(*) FROM raw.inference_logs;"
 ```
 
+![alt text](/images/postgres_1.png)
+
 Historial de batches:
 
 ```bash
@@ -561,6 +622,8 @@ kubectl exec -n mlops-pf $(kubectl get pod -n mlops-pf -l app=postgres -o jsonpa
   psql -U mlops_user -d mlops_real_estate -c \
   "SELECT batch_number, num_records, training_decision, training_reason, training_executed, model_promoted FROM raw.batch_metadata ORDER BY ingestion_timestamp DESC LIMIT 10;"
 ```
+
+![alt text](/images/postgres_historial.png)
 
 ### 15.3. Validar MLflow
 
@@ -570,13 +633,21 @@ Abrir http://localhost:5050 y verificar:
 2. Hay al menos un run con métricas: `mae`, `rmse`, `r2`, `mape`
 3. En **Models** existe `real-estate-price-model` con alias `@champion`
 
+![alt text](/images/mlflow_metrics.png)
+
+![alt text](/images/mlflow_champion2.png)
+
 ### 15.4. Validar MinIO
 
 Abrir http://localhost:9001 con `minioadmin / minioadmin`.
 
 Verificar que existe el bucket `mlflow-artifacts` con artefactos de MLflow (`MLmodel`, `model.pkl`, etc.).
 
+![alt text](/images/minio_console.png)
+
 ### 15.5. Validar FastAPI
+
+![alt text](/images/api_inference.png)
 
 Health check:
 
