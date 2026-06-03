@@ -387,17 +387,17 @@ A partir de este punto, cualquier `push` a `main` que modifique el directorio `k
 
 ![alt text](/images/airflow_dag.png)
 
-#Primera ejecución
+Primera ejecución
 
 ![alt text](/images/airflow_run1.png)
 
 ![alt text](/images/postgres_run1.png)
 
-#Segunda ejecución
+Segunda ejecución
 
 ![alt text](/images/airflow_run2.png)
 
-#Tercera ejecución
+Tercera ejecución
 
 ![alt text](/images/airflow_run3.png)
 
@@ -706,11 +706,11 @@ Abrir http://localhost:8501 y verificar:
 
 ![alt text](/images/streamlit_home.png)
 
-##Prueba de inferencia
+Prueba de inferencia
 
 ![alt text](/images/streamlit_inferencetest.png)
 
-##Historial de inferencia
+Historial de inferencia
 
 ![alt text](/images/streamlit_historial.png)
 
