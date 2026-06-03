@@ -655,7 +655,7 @@ Health check:
 curl http://localhost:8000/health
 ```
 
-Respuesta esperada:
+Ejemplo de respuesta esperada:
 
 ```json
 {
@@ -665,6 +665,8 @@ Respuesta esperada:
   "model_version": "1"
 }
 ```
+
+![alt text](/images/api_healthcheck.png)
 
 Predicción de prueba:
 
@@ -681,13 +683,17 @@ curl -X POST "http://localhost:8000/predict" \
   }'
 ```
 
+![alt text](/images/api_inferencetest.png)
+
 Verificar log de inferencia:
 
 ```bash
 kubectl exec -n mlops-pf $(kubectl get pod -n mlops-pf -l app=postgres -o jsonpath="{.items[0].metadata.name}") -- \
   psql -U mlops_user -d mlops_real_estate -c \
-  "SELECT request_id, predicted_price, model_version, response_time_ms, timestamp FROM raw.inference_logs ORDER BY timestamp DESC LIMIT 5;"
+  "SELECT request_id, prediction, model_version, response_time_ms, timestamp FROM raw.inference_logs ORDER BY timestamp DESC LIMIT 5;"
 ```
+
+![alt text](/images/api_inferencelog.png)
 
 ### 15.6. Validar Streamlit
 
@@ -697,6 +703,16 @@ Abrir http://localhost:8501 y verificar:
 2. El modelo mostrado es `models:/real-estate-price-model@champion`
 3. Completar los campos y presionar **Predecir precio**
 4. La pestaña **Historial de entrenamiento** muestra los batches procesados con su decisión
+
+![alt text](/images/streamlit_home.png)
+
+##Prueba de inferencia
+
+![alt text](/images/streamlit_inferencetest.png)
+
+##Historial de inferencia
+
+![alt text](/images/streamlit_historial.png)
 
 ### 15.7. Validar Locust
 
@@ -913,7 +929,54 @@ Los valores `NaN` de pandas no son válidos en JSON. El DAG usa `safe_float()` p
 
 ---
 
-## 21. Checklist final
+## 21. Mejoras futuras
+
+### CI/CD — Builds selectivos por servicio
+
+El workflow actual de GitHub Actions reconstruye todas las imágenes Docker en cada `push` a `main`, independientemente de qué archivos cambiaron. Esto genera builds innecesarios y aumenta el tiempo de entrega.
+
+La mejora consiste en usar `dorny/paths-filter` para detectar qué directorios cambiaron y reconstruir solo las imágenes afectadas:
+
+```yaml
+jobs:
+  changes:
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      airflow: ${{ steps.filter.outputs.airflow }}
+    steps:
+      - uses: dorny/paths-filter@v2
+        with:
+          filters: |
+            api:
+              - 'api/**'
+            airflow:
+              - 'airflow/**'
+
+  build-api:
+    needs: changes
+    if: ${{ needs.changes.outputs.api == 'true' }}
+    ...
+```
+
+### Logging asíncrono en la API
+
+Cada inferencia escribe síncronamente en PostgreSQL, lo que aumenta la latencia bajo carga. La mejora sería usar una cola interna (por ejemplo `asyncio.Queue` o Celery) para desacoplar la escritura del log de la respuesta al cliente.
+
+### Múltiples workers en la API
+
+El servicio FastAPI usa un solo proceso Uvicorn. Para escenarios de carga real se recomienda configurar múltiples workers o usar Gunicorn como process manager frente a Uvicorn.
+
+### Hyperparameter tuning automático
+
+El modelo actual usa parámetros fijos (`n_estimators=50`, `max_depth=4`). Una mejora sería integrar Optuna o MLflow Hyperparameter Tuning dentro del DAG para optimizar automáticamente los hiperparámetros en cada ciclo de entrenamiento.
+
+### Reentrenamiento automático por schedule
+
+El DAG actualmente se ejecuta de forma manual. Una mejora sería configurar un `schedule` en Airflow (por ejemplo cada 6 horas) para que el pipeline se ejecute automáticamente y consuma nuevos batches sin intervención humana.
+
+---
+
+## 22. Checklist final
 
 ### Infraestructura
 
