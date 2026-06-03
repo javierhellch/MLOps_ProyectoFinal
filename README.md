@@ -726,6 +726,8 @@ Ramp up:         2
 Host:            http://api:8000
 ```
 
+![alt text](/images/locust_test1.png)
+
 Ejecutar durante 1-2 minutos y verificar:
 
 - Requests totales > 0
@@ -736,6 +738,16 @@ Ejecutar durante 1-2 minutos y verificar:
 kubectl exec -n mlops-pf $(kubectl get pod -n mlops-pf -l app=postgres -o jsonpath="{.items[0].metadata.name}") -- \
   psql -U mlops_user -d mlops_real_estate -c "SELECT COUNT(*) FROM raw.inference_logs;"
 ```
+
+![alt text](/images/locust_inferencelogs.png)
+
+Estadísticas
+
+![alt text](/images/locust_statistics.png)
+
+Gráficos
+
+![alt text](/images/locust_charts.png)
 
 ### 15.8. Validar Prometheus
 
