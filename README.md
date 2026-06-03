@@ -789,6 +789,8 @@ La aplicación `mlops-pf` debe mostrar:
 STATUS: Synced   HEALTH: Healthy
 ```
 
+![alt text](/images/argo.png)
+
 ---
 
 ## 16. Selección de modelo champion por MAE
