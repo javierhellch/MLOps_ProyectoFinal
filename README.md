@@ -1,8 +1,8 @@
 # MLOps Proyecto Final — Real Estate Price Pipeline
 
-## Presentado por:
-## Jacobo Orozco
-## Javier Chaparro
+# Presentado por:
+- Jacobo Orozco
+- Javier Chaparro
 
 Proyecto académico de MLOps para construir un pipeline end-to-end de ingesta incremental, procesamiento, feature engineering, entrenamiento, registro, despliegue e inferencia de un modelo de predicción de precios inmobiliarios.
 
