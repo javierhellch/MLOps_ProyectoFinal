@@ -1,5 +1,9 @@
 # MLOps Proyecto Final — Real Estate Price Pipeline
 
+## Presentado por:
+## Jacobo Orozco
+## Javier Chaparro
+
 Proyecto académico de MLOps para construir un pipeline end-to-end de ingesta incremental, procesamiento, feature engineering, entrenamiento, registro, despliegue e inferencia de un modelo de predicción de precios inmobiliarios.
 
 El stack está desplegado completamente en **Kubernetes** (Docker Desktop), con imágenes publicadas en DockerHub, CI/CD mediante **GitHub Actions**, y GitOps mediante **Argo CD**. El sistema consume datos desde una API externa por lotes y selecciona automáticamente el mejor modelo usando MAE como métrica de promoción.
